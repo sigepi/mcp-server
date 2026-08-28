@@ -1,0 +1,40 @@
+import { McpServer } from "@modelcontextprotocol/server";
+import { createMcpHandler } from "agents/mcp/server";
+import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
+import { z } from "zod";
+import { AccessHandler } from "./access-handler";
+
+function createServer() {
+	const server = new McpServer({
+		name: "Obsidian Vault MCP",
+		version: "1.0.0",
+	});
+
+	// TODO: ここに既存のObsidian用ツール(read_note, search_notes 等)を
+	// server.registerTool(...) で登録する。
+	// 下の add はテンプレートの動作確認用サンプルなので、
+	// 実際のツールに繋がったら削除してOK。
+	server.registerTool(
+		"add",
+		{ inputSchema: z.object({ a: z.number(), b: z.number() }) },
+		async ({ a, b }) => ({
+			content: [{ type: "text", text: String(a + b) }],
+		}),
+	);
+
+	return server;
+}
+
+// createMcpHandler(createServer) は「関数そのもの」を返す。
+// OAuthProvider の apiHandler は fetch メソッドを持つオブジェクトを要求するため、
+// { fetch: ... } の形で包む必要がある。
+const mcpHandler = createMcpHandler(createServer);
+
+export default new OAuthProvider({
+	apiRoute: "/mcp",
+	apiHandler: { fetch: mcpHandler },
+	defaultHandler: AccessHandler,
+	authorizeEndpoint: "/authorize",
+	tokenEndpoint: "/token",
+	clientRegistrationEndpoint: "/register",
+});
