@@ -128,6 +128,20 @@ async function listVaultMarkdownPaths(env: Env, prefix = ""): Promise<string[]> 
 	return data.files.filter((f) => f.endsWith(".md")).map(fromWrapperPath);
 }
 
+/** 指定prefix配下のノートを一括取得する(GET /bulk-read) */
+async function readFolderBulkFromWrapper(
+	env: Env,
+	prefix: string,
+): Promise<{ path: string; content: string }[]> {
+	const p = toWrapperPath(prefix);
+	const res = await wrapperFetch(env, `/bulk-read?prefix=${encodeURIComponent(p)}`);
+	if (!res.ok) throw new Error(`一括取得に失敗 (${res.status}): ${await res.text()}`);
+	const data = (await res.json()) as { files: { path: string; content: string }[] };
+	return data.files
+		.filter((f) => f.path.endsWith(".md"))
+		.map((f) => ({ path: fromWrapperPath(f.path), content: f.content }));
+}
+
 /** 本文全文検索(サーバーサイド、VPS上のfsを直接検索するので高速・Vaultサイズ非依存) */
 async function searchNoteContentOnWrapper(
 	env: Env,
@@ -568,6 +582,53 @@ function createServer(env: Env) {
 				const content = await fetchNoteFromWrapper(env, path);
 				return {
 					content: [{ type: "text", text: content }],
+				};
+			} catch (err) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `エラー: ${err instanceof Error ? err.message : String(err)}`,
+						},
+					],
+					isError: true,
+				};
+			}
+		},
+	);
+
+	server.registerTool(
+		"read_folder_bulk",
+		{
+			description:
+				"Obsidian Vault内の指定フォルダ配下にある全ノート(.md)の中身を一括取得する。フォルダ内の複数ノートをまとめて読みたい時、search_notesで一覧を取ってから1件ずつread_noteするより高速。prefixはリポジトリルートからの相対パス(例: 'sige/10_Projects/oracle migrate')。",
+			inputSchema: z.object({
+				prefix: z.string().describe("取得したいフォルダのパス(相対パス)"),
+				limit: z
+					.number()
+					.optional()
+					.describe("最大何件返すか(デフォルト50、多すぎるフォルダ対策)"),
+			}),
+		},
+		async ({ prefix, limit }) => {
+			try {
+				const files = await readFolderBulkFromWrapper(env, prefix);
+				const capped = files.slice(0, limit ?? 50);
+				return {
+					content: [
+						{
+							type: "text",
+							text: JSON.stringify(
+								{
+									matched_count: files.length,
+									returned_count: capped.length,
+									files: capped,
+								},
+								null,
+								2,
+							),
+						},
+					],
 				};
 			} catch (err) {
 				return {
