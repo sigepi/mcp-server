@@ -11,10 +11,9 @@ type Env = {
 	ACCESS_TOKEN_URL: string;
 	ACCESS_AUTHORIZATION_URL: string;
 	ALLOWED_EMAIL?: string;
-	// GitHub経由でObsidian Vault(private repo)を読み書きするための設定
-	GITHUB_TOKEN: string;
-	GITHUB_OWNER: string;
-	GITHUB_REPO: string;
+	// Honoラッパー(VPS上のvault-files)経由でObsidian Vaultを読み書きするための設定
+	WRAPPER_BASE_URL: string; // 例: "https://vault-api.sigeur.com"
+	WRAPPER_AUTH_TOKEN: string;
 	// Nextcloud CalDAV連携用
 	NEXTCLOUD_USERNAME: string;
 	NEXTCLOUD_APP_PASSWORD: string;
@@ -22,244 +21,92 @@ type Env = {
 	NEXTCLOUD_WEBDAV_PASSWORD: string;
 };
 
-//note read start?
+//note read/write start (旧: GitHub Contents/Trees API → Honoラッパー(VPS)経由に切替)
 
 /**
- * GitHub Contents APIで指定パスのファイルを1本取得する。
- * private repoでも GITHUB_TOKEN (fine-grained PAT, Contents権限) があれば読める。
+ * ツール呼び出し側は従来通り "sige/" プレフィックス付きパスを渡す想定(後方互換)。
+ * Honoラッパー(vault-files直下、"sige/"なし)向けの実パスに変換する。
  */
-async function fetchNoteFromGitHub(env: Env, path: string): Promise<string> {
-	const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/contents/${path}`;
+function toWrapperPath(repoPath: string): string {
+	return repoPath.startsWith("sige/") ? repoPath.slice("sige/".length) : repoPath;
+}
 
-	const res = await fetch(url, {
+/** wrapper→呼び出し側の表記に戻す("sige/"を付け直す) */
+function fromWrapperPath(vaultPath: string): string {
+	return `sige/${vaultPath}`;
+}
+
+async function wrapperFetch(env: Env, path: string, init?: RequestInit): Promise<Response> {
+	return fetch(`${env.WRAPPER_BASE_URL}${path}`, {
+		...init,
 		headers: {
-			Authorization: `Bearer ${env.GITHUB_TOKEN}`,
-			"User-Agent": "obsidian-mcp-server",
-			Accept: "application/vnd.github.v3+json",
+			...(init?.headers ?? {}),
+			Authorization: `Bearer ${env.WRAPPER_AUTH_TOKEN}`,
 		},
 	});
-
-	if (res.status === 404) {
-		throw new Error(`ノートが見つからへんかった: ${path}`);
-	}
-	if (!res.ok) {
-		const text = await res.text();
-		throw new Error(`GitHub APIエラー (${res.status}): ${text}`);
-	}
-
-	const data = (await res.json()) as { content: string; encoding: string };
-	if (data.encoding !== "base64") {
-		throw new Error(`想定外のencoding: ${data.encoding}`);
-	}
-
-	// GitHub APIのbase64は改行区切りで返ってくるので除去してからデコード
-	const base64 = data.content.replace(/\n/g, "");
-	const binary = atob(base64);
-	// atob()は1バイト=1文字として返すため、UTF-8のマルチバイト文字(日本語等)が
-	// そのままだと文字化けする。バイト列に変換してからUTF-8として正しくデコードする。
-	const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
-	return new TextDecoder("utf-8").decode(bytes);
-}
-//note read end ?
-
-//note search start
-
-/**
- * リポジトリのデフォルトブランチ名を取得する(main / master どちらでも対応するため)。
- */
-async function fetchDefaultBranch(env: Env): Promise<string> {
-	const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}`;
-	const res = await fetch(url, {
-		headers: {
-			Authorization: `Bearer ${env.GITHUB_TOKEN}`,
-			"User-Agent": "obsidian-mcp-server",
-			Accept: "application/vnd.github.v3+json",
-		},
-	});
-	if (!res.ok) {
-		throw new Error(`リポジトリ情報の取得に失敗 (${res.status}): ${await res.text()}`);
-	}
-	const data = (await res.json()) as { default_branch: string };
-	return data.default_branch;
 }
 
-/**
- * GitHub Git Trees API(recursive)でVault内の.mdファイルパス一覧を丸ごと取得する。
- * Vaultが極端に巨大(数万ファイル)だとGitHub側がtruncated:trueを返すことがあるが、
- * 個人のObsidian Vault規模なら通常は全件取れる。
- */
-async function fetchVaultMarkdownPaths(env: Env): Promise<string[]> {
-	const branch = await fetchDefaultBranch(env);
-	const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/git/trees/${branch}?recursive=1`;
-
-	const res = await fetch(url, {
-		headers: {
-			Authorization: `Bearer ${env.GITHUB_TOKEN}`,
-			"User-Agent": "obsidian-mcp-server",
-			Accept: "application/vnd.github.v3+json",
-		},
-	});
-	if (!res.ok) {
-		throw new Error(`ファイル一覧の取得に失敗 (${res.status}): ${await res.text()}`);
-	}
-
-	const data = (await res.json()) as {
-		tree: { path: string; type: string }[];
-		truncated?: boolean;
-	};
-
-	return data.tree
-		.filter((item) => item.type === "blob" && item.path.endsWith(".md"))
-		.map((item) => item.path);
+/** 指定パスのノート本文を1本取得する */
+async function fetchNoteFromWrapper(env: Env, repoPath: string): Promise<string> {
+	const p = toWrapperPath(repoPath);
+	const res = await wrapperFetch(env, `/file?path=${encodeURIComponent(p)}`);
+	if (res.status === 404) throw new Error(`ノートが見つからへんかった: ${repoPath}`);
+	if (!res.ok) throw new Error(`ラッパーAPIエラー (${res.status}): ${await res.text()}`);
+	return res.text();
 }
 
-/**
- * マッチ箇所の前後を切り出してスニペットを作る(本文全文検索用)。
- */
-function makeSnippet(content: string, query: string, contextChars = 40): string {
-	const idx = content.toLowerCase().indexOf(query.toLowerCase());
-	if (idx === -1) return "";
-	const start = Math.max(0, idx - contextChars);
-	const end = Math.min(content.length, idx + query.length + contextChars);
-	const prefix = start > 0 ? "…" : "";
-	const suffix = end < content.length ? "…" : "";
-	return prefix + content.slice(start, end).replace(/\n/g, " ") + suffix;
+/** ノートが存在するかだけ確認する(create/append/update/deleteの事前チェック用) */
+async function noteExistsOnWrapper(env: Env, repoPath: string): Promise<boolean> {
+	const p = toWrapperPath(repoPath);
+	const res = await wrapperFetch(env, `/file?path=${encodeURIComponent(p)}`);
+	if (res.status === 404) return false;
+	if (!res.ok) throw new Error(`ラッパーAPIエラー (${res.status}): ${await res.text()}`);
+	return true;
 }
 
-//note search end
-
-//note write start
-
-/**
- * UTF-8文字列(日本語含む)をGitHub Contents APIが要求するbase64に変換する。
- */
-function toBase64Utf8(str: string): string {
-	const bytes = new TextEncoder().encode(str);
-	let binary = "";
-	for (const b of bytes) binary += String.fromCharCode(b);
-	return btoa(binary);
-}
-
-/**
- * ノートの現在の中身とSHAをまとめて取得する。存在しない場合はnullを返す(例外にしない)。
- * SHAは追記/上書き更新時にGitHub APIへ渡す競合検知用の値。
- */
-async function fetchNoteMeta(
-	env: Env,
-	path: string,
-): Promise<{ content: string; sha: string } | null> {
-	const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/contents/${path}`;
-	const res = await fetch(url, {
-		headers: {
-			Authorization: `Bearer ${env.GITHUB_TOKEN}`,
-			"User-Agent": "obsidian-mcp-server",
-			Accept: "application/vnd.github.v3+json",
-		},
-	});
-	if (res.status === 404) return null;
-	if (!res.ok) {
-		throw new Error(`ノート情報の取得に失敗 (${res.status}): ${await res.text()}`);
-	}
-	const data = (await res.json()) as { content: string; encoding: string; sha: string };
-	if (data.encoding !== "base64") {
-		throw new Error(`想定外のencoding: ${data.encoding}`);
-	}
-	const base64 = data.content.replace(/\n/g, "");
-	const binary = atob(base64);
-	const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
-	return { content: new TextDecoder("utf-8").decode(bytes), sha: data.sha };
-}
-
-/**
- * GitHub Contents APIでノートを作成/更新する(自動コミット)。
- * shaを渡すと更新、渡さないと新規作成として扱われる。
- */
-async function putNoteToGitHub(
-	env: Env,
-	path: string,
-	content: string,
-	sha?: string,
-	message?: string,
-): Promise<{ html_url: string }> {
-	const branch = await fetchDefaultBranch(env);
-	const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/contents/${path}`;
-
-	const body: Record<string, unknown> = {
-		message: message ?? (sha ? `Update ${path} via Obsidian MCP` : `Create ${path} via Obsidian MCP`),
-		content: toBase64Utf8(content),
-		branch,
-	};
-	if (sha) body.sha = sha;
-
-	const res = await fetch(url, {
+/** ノートを作成/上書きする */
+async function putNoteToWrapper(env: Env, repoPath: string, content: string): Promise<void> {
+	const p = toWrapperPath(repoPath);
+	const res = await wrapperFetch(env, `/file?path=${encodeURIComponent(p)}`, {
 		method: "PUT",
-		headers: {
-			Authorization: `Bearer ${env.GITHUB_TOKEN}`,
-			"User-Agent": "obsidian-mcp-server",
-			Accept: "application/vnd.github.v3+json",
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify(body),
+		body: content,
 	});
-
-	if (!res.ok) {
-		const text = await res.text();
-		if (res.status === 403 || res.status === 401) {
-			throw new Error(
-				`書き込みに失敗 (${res.status}): GITHUB_TOKENの権限を確認して(Contents権限がRead and writeになってるか)。詳細: ${text}`,
-			);
-		}
-		if (res.status === 409) {
-			throw new Error(
-				`書き込みに失敗 (409): 他の変更と競合した可能性がある。もう一度読み直してから再実行して。詳細: ${text}`,
-			);
-		}
-		throw new Error(`書き込みに失敗 (${res.status}): ${text}`);
-	}
-
-	const data = (await res.json()) as { content: { html_url: string } };
-	return { html_url: data.content.html_url };
+	if (!res.ok) throw new Error(`書き込みに失敗 (${res.status}): ${await res.text()}`);
 }
 
-/**
- * GitHub Contents APIでノートを削除する(自動コミット)。SHAが必須。
- */
-async function deleteNoteFromGitHub(
-	env: Env,
-	path: string,
-	sha: string,
-	message?: string,
-): Promise<void> {
-	const branch = await fetchDefaultBranch(env);
-	const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/contents/${path}`;
-
-	const res = await fetch(url, {
+/** ノートを削除する */
+async function deleteNoteFromWrapper(env: Env, repoPath: string): Promise<void> {
+	const p = toWrapperPath(repoPath);
+	const res = await wrapperFetch(env, `/file?path=${encodeURIComponent(p)}`, {
 		method: "DELETE",
-		headers: {
-			Authorization: `Bearer ${env.GITHUB_TOKEN}`,
-			"User-Agent": "obsidian-mcp-server",
-			Accept: "application/vnd.github.v3+json",
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify({
-			message: message ?? `Delete ${path} via Obsidian MCP`,
-			sha,
-			branch,
-		}),
 	});
-
-	if (!res.ok) {
-		const text = await res.text();
-		if (res.status === 403 || res.status === 401) {
-			throw new Error(
-				`削除に失敗 (${res.status}): GITHUB_TOKENの権限を確認して(Contents権限がRead and writeになってるか)。詳細: ${text}`,
-			);
-		}
-		throw new Error(`削除に失敗 (${res.status}): ${text}`);
-	}
+	if (!res.ok) throw new Error(`削除に失敗 (${res.status}): ${await res.text()}`);
 }
 
-//note write end
+/** Vault内の.mdファイルパス一覧を取得する(search_notes用) */
+async function listVaultMarkdownPaths(env: Env, prefix = ""): Promise<string[]> {
+	const p = toWrapperPath(prefix);
+	const res = await wrapperFetch(env, `/list?prefix=${encodeURIComponent(p)}`);
+	if (!res.ok) throw new Error(`ファイル一覧の取得に失敗 (${res.status}): ${await res.text()}`);
+	const data = (await res.json()) as { files: string[] };
+	return data.files.filter((f) => f.endsWith(".md")).map(fromWrapperPath);
+}
+
+/** 本文全文検索(サーバーサイド、VPS上のfsを直接検索するので高速・Vaultサイズ非依存) */
+async function searchNoteContentOnWrapper(
+	env: Env,
+	query: string,
+	prefix: string,
+): Promise<{ path: string; snippet: string }[]> {
+	const p = toWrapperPath(prefix);
+	const url = `/search?q=${encodeURIComponent(query)}&prefix=${encodeURIComponent(p)}`;
+	const res = await wrapperFetch(env, url);
+	if (!res.ok) throw new Error(`検索に失敗 (${res.status}): ${await res.text()}`);
+	const data = (await res.json()) as { hits: { path: string; snippet: string }[] };
+	return data.hits.map((h) => ({ path: fromWrapperPath(h.path), snippet: h.snippet }));
+}
+
+//note read/write end
 
 //start url settings
 const CALDAV_BASE = "https://fie.nl.tab.digital/remote.php/dav/calendars";
@@ -502,7 +349,7 @@ function parseICS(ics: string) {
 //calendar helpers end
 
 //read file helpers start
-async function readFile(path, env) {
+async function readFile(path: string, env: Env) {
   const url = `${WEBDAV_BASE}/${path}`;
   const auth = btoa(`sige:${env.NEXTCLOUD_WEBDAV_PASSWORD}`);
 
@@ -535,7 +382,7 @@ async function readFile(path, env) {
 //read file helpers end
 
 //upload file helpers start
-async function uploadFile(path, content, env) {
+async function uploadFile(path: string, content: string, env: Env) {
   const url = `${WEBDAV_BASE}/${path}`;
   const auth = btoa(`sige:${env.NEXTCLOUD_WEBDAV_PASSWORD}`);
 
@@ -558,7 +405,7 @@ async function uploadFile(path, content, env) {
 //upload file helpers end
 
 //delete file helpers start
-async function deleteFile(path, env) {
+async function deleteFile(path: string, env: Env) {
   const url = `${WEBDAV_BASE}/${path}`;
   const auth = btoa(`sige:${env.NEXTCLOUD_WEBDAV_PASSWORD}`);
 
@@ -579,7 +426,7 @@ async function deleteFile(path, env) {
 //delete file helpers end
 
 //MKKOL helpers start
-async function createFolder(path, env) {
+async function createFolder(path: string, env: Env) {
   const url = `${WEBDAV_BASE}/${path}`;
   const auth = btoa(`sige:${env.NEXTCLOUD_WEBDAV_PASSWORD}`);
 
@@ -607,7 +454,7 @@ async function createFolder(path, env) {
 
 
 //start list file helper
-async function listFiles(path, env) {
+async function listFiles(path: string, env: Env) {
   const url = `${WEBDAV_BASE}/${path}`;
   const auth = btoa(`sige:${env.NEXTCLOUD_WEBDAV_PASSWORD}`);
 
@@ -638,7 +485,7 @@ async function listFiles(path, env) {
   return parseWebDavResponse(xml);
 }
 
-function parseWebDavResponse(xml) {
+function parseWebDavResponse(xml: string) {
   const items = [];
   const responseBlocks = xml.match(/<d:response>[\s\S]*?<\/d:response>/g) || [];
 
@@ -675,14 +522,14 @@ function createServer(env: Env) {
 		"read_note",
 		{
 			description:
-				"Obsidian Vault内の指定パスのノート(Markdownファイル)を1本読み込む。pathはリポジトリルートからの相対パス(例: 'daily/2026-08-12.md')。",
+				"Obsidian Vault内の指定パスのノート(Markdownファイル)を1本読み込む。pathはリポジトリルートからの相対パス(例: 'sige/daily/2026-08-12.md')。",
 			inputSchema: z.object({
 				path: z.string().describe("リポジトリルートからの相対パス"),
 			}),
 		},
 		async ({ path }) => {
 			try {
-				const content = await fetchNoteFromGitHub(env, path);
+				const content = await fetchNoteFromWrapper(env, path);
 				return {
 					content: [{ type: "text", text: content }],
 				};
@@ -717,7 +564,7 @@ function createServer(env: Env) {
 		},
 		async ({ query, limit }) => {
 			try {
-				const paths = await fetchVaultMarkdownPaths(env);
+				const paths = await listVaultMarkdownPaths(env);
 				const q = query.toLowerCase();
 				const matched = paths.filter((p) => p.toLowerCase().includes(q));
 				const capped = matched.slice(0, limit ?? 20);
@@ -756,45 +603,18 @@ function createServer(env: Env) {
 		"search_note_content",
 		{
 			description:
-				"Obsidian Vault内のノートの本文中身を全文検索する。ヒットしたファイルのパスと前後の抜粋(スニペット)を返す。Vaultが大きい場合は処理するファイル数に上限があるため、path_prefixでフォルダを絞り込むと確実性が上がる。",
+				"Obsidian Vault内のノートの本文中身を全文検索する。ヒットしたファイルのパスと前後の抜粋(スニペット)を返す。VPS上のfsを直接検索するので、Vaultサイズによる制限は実質ない。",
 			inputSchema: z.object({
 				query: z.string().describe("本文中で探すキーワード"),
 				path_prefix: z
 					.string()
 					.optional()
-					.describe("この文字列で始まるパスのファイルだけを対象にする(例: 'daily/')"),
-				max_files_to_scan: z
-					.number()
-					.optional()
-					.describe("最大何ファイルまで中身を確認するか(デフォルト100、多いとGitHub APIコール数が増える)"),
-				max_results: z
-					.number()
-					.optional()
-					.describe("最大何件のヒットを返すか(デフォルト20)"),
+					.describe("この文字列で始まるパスのファイルだけを対象にする(例: 'sige/daily/')"),
 			}),
 		},
-		async ({ query, path_prefix, max_files_to_scan, max_results }) => {
+		async ({ query, path_prefix }) => {
 			try {
-				let paths = await fetchVaultMarkdownPaths(env);
-				if (path_prefix) {
-					paths = paths.filter((p) => p.startsWith(path_prefix));
-				}
-
-				const scanLimit = max_files_to_scan ?? 100;
-				const resultLimit = max_results ?? 20;
-				const targetPaths = paths.slice(0, scanLimit);
-
-				const results: { path: string; snippet: string }[] = [];
-				let scanned = 0;
-
-				for (const path of targetPaths) {
-					scanned++;
-					const content = await fetchNoteFromGitHub(env, path);
-					if (content.toLowerCase().includes(query.toLowerCase())) {
-						results.push({ path, snippet: makeSnippet(content, query) });
-						if (results.length >= resultLimit) break;
-					}
-				}
+				const results = await searchNoteContentOnWrapper(env, query, path_prefix ?? "");
 
 				return {
 					content: [
@@ -802,13 +622,7 @@ function createServer(env: Env) {
 							type: "text",
 							text: JSON.stringify(
 								{
-									total_candidate_files: paths.length,
-									scanned_files: scanned,
 									hit_count: results.length,
-									note:
-										scanned < paths.length
-											? `候補${paths.length}件中${scanned}件しかスキャンしてへん。path_prefixで絞るか max_files_to_scan を増やすともっと網羅できる。`
-											: undefined,
 									results,
 								},
 								null,
@@ -843,13 +657,11 @@ function createServer(env: Env) {
 			inputSchema: z.object({
 				path: z.string().describe("作成するノートのリポジトリルートからの相対パス(例: 'sige/memo.md')"),
 				content: z.string().describe("ノートの中身(Markdown本文)"),
-				message: z.string().optional().describe("コミットメッセージ(省略時は自動生成)"),
 			}),
 		},
-		async ({ path, content, message }) => {
+		async ({ path, content }) => {
 			try {
-				const existing = await fetchNoteMeta(env, path);
-				if (existing) {
+				if (await noteExistsOnWrapper(env, path)) {
 					return {
 						content: [
 							{
@@ -860,9 +672,9 @@ function createServer(env: Env) {
 						isError: true,
 					};
 				}
-				const result = await putNoteToGitHub(env, path, content, undefined, message);
+				await putNoteToWrapper(env, path, content);
 				return {
-					content: [{ type: "text", text: `作成した: ${path}\n${result.html_url}` }],
+					content: [{ type: "text", text: `作成した: ${path}` }],
 				};
 			} catch (err) {
 				return {
@@ -887,13 +699,14 @@ function createServer(env: Env) {
 					.string()
 					.optional()
 					.describe("既存本文と追記内容の間に挟む文字列(デフォルトは改行1つ '\\n')"),
-				message: z.string().optional().describe("コミットメッセージ(省略時は自動生成)"),
 			}),
 		},
-		async ({ path, content, separator, message }) => {
+		async ({ path, content, separator }) => {
 			try {
-				const existing = await fetchNoteMeta(env, path);
-				if (!existing) {
+				let existing: string;
+				try {
+					existing = await fetchNoteFromWrapper(env, path);
+				} catch {
 					return {
 						content: [
 							{
@@ -904,10 +717,10 @@ function createServer(env: Env) {
 						isError: true,
 					};
 				}
-				const newContent = existing.content + (separator ?? "\n") + content;
-				const result = await putNoteToGitHub(env, path, newContent, existing.sha, message);
+				const newContent = existing + (separator ?? "\n") + content;
+				await putNoteToWrapper(env, path, newContent);
 				return {
-					content: [{ type: "text", text: `追記した: ${path}\n${result.html_url}` }],
+					content: [{ type: "text", text: `追記した: ${path}` }],
 				};
 			} catch (err) {
 				return {
@@ -928,13 +741,11 @@ function createServer(env: Env) {
 			inputSchema: z.object({
 				path: z.string().describe("上書き対象ノートのリポジトリルートからの相対パス"),
 				content: z.string().describe("新しいノートの中身(全文、Markdown)"),
-				message: z.string().optional().describe("コミットメッセージ(省略時は自動生成)"),
 			}),
 		},
-		async ({ path, content, message }) => {
+		async ({ path, content }) => {
 			try {
-				const existing = await fetchNoteMeta(env, path);
-				if (!existing) {
+				if (!(await noteExistsOnWrapper(env, path))) {
 					return {
 						content: [
 							{
@@ -945,9 +756,9 @@ function createServer(env: Env) {
 						isError: true,
 					};
 				}
-				const result = await putNoteToGitHub(env, path, content, existing.sha, message);
+				await putNoteToWrapper(env, path, content);
 				return {
-					content: [{ type: "text", text: `更新した: ${path}\n${result.html_url}` }],
+					content: [{ type: "text", text: `更新した: ${path}` }],
 				};
 			} catch (err) {
 				return {
@@ -967,13 +778,11 @@ function createServer(env: Env) {
 				"Obsidian Vault内の既存ノートを削除する。ノートが存在しない場合はエラーになる。削除は取り消せないので、確実に消したいノートのpathを指定すること。",
 			inputSchema: z.object({
 				path: z.string().describe("削除対象ノートのリポジトリルートからの相対パス"),
-				message: z.string().optional().describe("コミットメッセージ(省略時は自動生成)"),
 			}),
 		},
-		async ({ path, message }) => {
+		async ({ path }) => {
 			try {
-				const existing = await fetchNoteMeta(env, path);
-				if (!existing) {
+				if (!(await noteExistsOnWrapper(env, path))) {
 					return {
 						content: [
 							{ type: "text", text: `エラー: ${path} が見つからへん。既に削除済みかパス間違いかも。` },
@@ -981,7 +790,7 @@ function createServer(env: Env) {
 						isError: true,
 					};
 				}
-				await deleteNoteFromGitHub(env, path, existing.sha, message);
+				await deleteNoteFromWrapper(env, path);
 				return {
 					content: [{ type: "text", text: `削除した: ${path}` }],
 				};
@@ -1719,7 +1528,7 @@ server.registerTool(
 /**
  * OAuthProviderのapiHandlerはfetchメソッドを持つオブジェクトを要求する。
  * リクエストごとにenvを閉じ込めたcreateServer(env)を組み立て直すことで、
- * ツール内で確実にGITHUB_TOKEN等のSecretsにアクセスできるようにしている。
+ * ツール内で確実にWRAPPER_AUTH_TOKEN等のSecretsにアクセスできるようにしている。
  */
 const apiFetch = async (request: Request, env: Env, ctx: ExecutionContext) => {
 	const handler = createMcpHandler(() => createServer(env));
