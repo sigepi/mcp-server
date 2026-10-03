@@ -118,6 +118,40 @@ async function resolveConflictOnWrapper(env: Env, repoPath: string, rev: string)
 	const data = (await res.json()) as { status: string; keptRev: string; output?: string };
 	return data.output ?? data.status;
 }
+/**note_move helper start*/
+/** 移動結果1件分(POST /move の results 要素) */
+type MoveResult = {
+	from: string;
+	to: string;
+	status: "planned" | "moved" | "skipped" | "error";
+	reason?: string;
+};
+
+/**
+ * 複数ノートを移動する(POST /move)。dryRun=trueのときは計画だけ返して何も動かさない。
+ * 移動はVPS内のfs操作で完結する(本文はここを通らない)。上書きはせず、移動先に同名があればskipped。
+ */
+async function moveNotesOnWrapper(
+	env: Env,
+	moves: { from: string; to: string }[],
+	dryRun: boolean,
+): Promise<MoveResult[]> {
+	const res = await wrapperFetch(env, `/move`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({
+			moves: moves.map((m) => ({ from: toWrapperPath(m.from), to: toWrapperPath(m.to) })),
+			dryRun,
+		}),
+	});
+	if (!res.ok) throw new Error(`移動に失敗 (${res.status}): ${await res.text()}`);
+	const data = (await res.json()) as { dryRun: boolean; results: MoveResult[] };
+	return data.results.map((r) => ({
+		...r,
+		from: fromWrapperPath(r.from),
+		to: fromWrapperPath(r.to),
+	}));
+}
 
 /** Vault内の.mdファイルパス一覧を取得する(search_notes用) */
 async function listVaultMarkdownPaths(env: Env, prefix = ""): Promise<string[]> {
@@ -973,6 +1007,71 @@ function createServer(env: Env) {
 			}
 		},
 	);
+
+	/** move helper */
+	server.registerTool(
+		"move_notes",
+		{
+			description:
+				"Obsidian Vault内のノート(またはファイル)を別のパスへ移動する。1回で最大50件。必ず最初にdry_run: true(デフォルト)で計画を作り、内容をユーザーに見せて承認を取ってからdry_run: falseで実行すること。移動先に同名ファイルがある場合は上書きせずskippedになる。パス指定のリンク([[フォルダ/ノート]]等)の書き換えはしない。実行後にskippedやerrorがあれば、必ずユーザーに報告すること。",
+			inputSchema: z.object({
+				moves: z
+					.array(
+						z.object({
+							from: z
+								.string()
+								.describe("移動元のリポジトリルートからの相対パス(例: 'sige/00_Inbox/Clippings/A.md')"),
+							to: z
+								.string()
+								.describe(
+									"移動先のリポジトリルートからの相対パス。ファイル名まで含める(例: 'sige/30_Resources/料理レシピ/A.md')",
+								),
+						}),
+					)
+					.min(1)
+					.max(50)
+					.describe("移動の組のリスト(最大50件)"),
+				dry_run: z
+					.boolean()
+					.optional()
+					.describe("true(デフォルト)なら計画だけ返して何も動かさない。実際に移動するときだけfalseを指定"),
+			}),
+		},
+		async ({ moves, dry_run }) => {
+			try {
+				const dryRun = dry_run ?? true;
+				const results = await moveNotesOnWrapper(env, moves, dryRun);
+				const count = (s: MoveResult["status"]) => results.filter((r) => r.status === s).length;
+				return {
+					content: [
+						{
+							type: "text",
+							text: JSON.stringify(
+								{
+									dry_run: dryRun,
+									planned: count("planned"),
+									moved: count("moved"),
+									skipped: count("skipped"),
+									error: count("error"),
+									results,
+								},
+								null,
+								2,
+							),
+						},
+					],
+				};
+			} catch (err) {
+				return {
+					content: [
+						{ type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` },
+					],
+					isError: true,
+				};
+			}
+		},
+	);
+// move register end
 
 	//note write tools end
 
