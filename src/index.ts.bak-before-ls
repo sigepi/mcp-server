@@ -65,16 +65,10 @@ async function noteExistsOnWrapper(env: Env, repoPath: string): Promise<boolean>
 }
 
 /** ノートを作成/上書きする */
-async function putNoteToWrapper(
-	env: Env,
-	repoPath: string,
-	content: string,
-	tool: "create_note" | "append_to_note" | "update_note",
-): Promise<void> {
+async function putNoteToWrapper(env: Env, repoPath: string, content: string): Promise<void> {
 	const p = toWrapperPath(repoPath);
 	const res = await wrapperFetch(env, `/file?path=${encodeURIComponent(p)}`, {
 		method: "PUT",
-		headers: { "X-MCP-Tool": tool }, // 監査ログ(R2)用: どのツール経由の書き込みか
 		body: content,
 	});
 	if (!res.ok) throw new Error(`書き込みに失敗 (${res.status}): ${await res.text()}`);
@@ -85,7 +79,6 @@ async function deleteNoteFromWrapper(env: Env, repoPath: string): Promise<void> 
 	const p = toWrapperPath(repoPath);
 	const res = await wrapperFetch(env, `/file?path=${encodeURIComponent(p)}`, {
 		method: "DELETE",
-		headers: { "X-MCP-Tool": "delete_note" },
 	});
 	if (!res.ok) throw new Error(`削除に失敗 (${res.status}): ${await res.text()}`);
 }
@@ -118,7 +111,7 @@ async function resolveConflictOnWrapper(env: Env, repoPath: string, rev: string)
 	const p = toWrapperPath(repoPath);
 	const res = await wrapperFetch(env, `/resolve`, {
 		method: "POST",
-		headers: { "Content-Type": "application/json", "X-MCP-Tool": "resolve_conflict" },
+		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ path: p, rev }),
 	});
 	if (!res.ok) throw new Error(`コンフリクト解消に失敗 (${res.status}): ${await res.text()}`);
@@ -145,7 +138,7 @@ async function moveNotesOnWrapper(
 ): Promise<MoveResult[]> {
 	const res = await wrapperFetch(env, `/move`, {
 		method: "POST",
-		headers: { "Content-Type": "application/json", "X-MCP-Tool": "move_notes" },
+		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({
 			moves: moves.map((m) => ({ from: toWrapperPath(m.from), to: toWrapperPath(m.to) })),
 			dryRun,
@@ -204,7 +197,7 @@ async function editNoteOnWrapper(
 ): Promise<EditNoteResult> {
 	const res = await wrapperFetch(env, `/edit`, {
 		method: "POST",
-		headers: { "Content-Type": "application/json", "X-MCP-Tool": "edit_note" },
+		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({
 			path: toWrapperPath(repoPath),
 			edits: edits.map((e) => ({
@@ -243,33 +236,6 @@ async function readFolderBulkFromWrapper(
 		.filter((f) => f.path.endsWith(".md"))
 		.map((f) => ({ path: fromWrapperPath(f.path), content: f.content }));
 }
-
-/** 追加 */
-type LsEntry = { path: string; type: "d" | "f"; size?: number; mtime?: string };
-
-/** Honoラッパーの /ls を叩く。prefixは "sige/..." でも "sige" でも可。返却パスには "sige/" を付け直す */
-async function listFolderOnWrapper(
-	env: Env,
-	prefix: string,
-	depth: number,
-	details: boolean,
-	limit: number,
-): Promise<{ count: number; truncated: boolean; entries: LsEntry[] }> {
-	const trimmed = prefix.replace(/\/+$/, "");
-	const p = trimmed === "sige" ? "" : toWrapperPath(trimmed);
-	const res = await wrapperFetch(
-		env,
-		`/ls?prefix=${encodeURIComponent(p)}&depth=${depth}&details=${details}&limit=${limit}`,
-	);
-	if (!res.ok) throw new Error(await readWrapperError(res));
-	const data = (await res.json()) as { count: number; truncated: boolean; entries: LsEntry[] };
-	return {
-		count: data.count,
-		truncated: data.truncated,
-		entries: data.entries.map((e) => ({ ...e, path: fromWrapperPath(e.path) })),
-	};
-}
-/** 追加end */
 
 /** 本文全文検索(サーバーサイド、VPS上のfsを直接検索するので高速・Vaultサイズ非依存) */
 async function searchNoteContentOnWrapper(
@@ -773,47 +739,6 @@ function createServer(env: Env) {
 		},
 	);
 
-//* 追加 */
-	server.registerTool(
-		"list_folder",
-		{
-			description:
-				"Obsidian Vault内のフォルダ構成を一覧する(フォルダが先、ファイルが後)。vaultの構造確認や整理作業向け。pathは'sige/'付きの相対パス(省略時はvaultルート)。details:trueでサイズと更新日時(JST)も付く。depthは1〜3、デフォルト1。limit超過時は打ち切られる。",
-			inputSchema: z.object({
-				path: z.string().optional().describe("対象フォルダ(例: 'sige/10_Projects')。省略時は'sige'"),
-				depth: z.number().int().min(1).max(3).optional().describe("掘る深さ(デフォルト1、最大3)"),
-				details: z.boolean().optional().describe("trueでサイズと更新日時を付ける(デフォルトfalse)"),
-				limit: z.number().int().min(1).max(500).optional().describe("最大件数(デフォルト200、最大500)"),
-			}),
-		},
-		async ({ path, depth, details, limit }) => {
-			try {
-				const base = path ?? "sige";
-				const d = depth ?? 1;
-				const r = await listFolderOnWrapper(env, base, d, details ?? false, limit ?? 200);
-				const fmtSize = (n: number) =>
-					n < 1024 ? `${n}B` : n < 1048576 ? `${(n / 1024).toFixed(1)}KB` : `${(n / 1048576).toFixed(1)}MB`;
-				const fmtTime = (iso: string) =>
-					new Date(new Date(iso).getTime() + 9 * 3600 * 1000).toISOString().slice(0, 16).replace("T", " ");
-				const lines = r.entries.map((e) => {
-					if (e.type === "d") return `d  ${e.path}/`;
-					const extra =
-						e.size !== undefined && e.mtime ? `  ${fmtSize(e.size)}  ${fmtTime(e.mtime)}` : "";
-					return `f  ${e.path}${extra}`;
-				});
-				const head = `# ${base} depth=${d} ${r.count}件${r.truncated ? "(上限で打ち切り。limitかpathを調整)" : ""}`;
-				return { content: [{ type: "text", text: [head, ...lines].join("\n") }] };
-			} catch (err) {
-				return {
-					content: [{ type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` }],
-					isError: true,
-				};
-			}
-		},
-	);
-//* 追加end */
-
-
 	//note search tools start
 
 	server.registerTool(
@@ -939,7 +864,7 @@ function createServer(env: Env) {
 						isError: true,
 					};
 				}
-				await putNoteToWrapper(env, path, content, "create_note");
+				await putNoteToWrapper(env, path, content);
 				return {
 					content: [{ type: "text", text: `作成した: ${path}` }],
 				};
@@ -985,7 +910,7 @@ function createServer(env: Env) {
 					};
 				}
 				const newContent = existing + (separator ?? "\n") + content;
-				await putNoteToWrapper(env, path, newContent, "append_to_note");
+				await putNoteToWrapper(env, path, newContent);
 				return {
 					content: [{ type: "text", text: `追記した: ${path}` }],
 				};
@@ -1023,7 +948,7 @@ function createServer(env: Env) {
 						isError: true,
 					};
 				}
-				await putNoteToWrapper(env, path, content, "update_note");
+				await putNoteToWrapper(env, path, content);
 				return {
 					content: [{ type: "text", text: `更新した: ${path}` }],
 				};

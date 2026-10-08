@@ -65,16 +65,10 @@ async function noteExistsOnWrapper(env: Env, repoPath: string): Promise<boolean>
 }
 
 /** ノートを作成/上書きする */
-async function putNoteToWrapper(
-	env: Env,
-	repoPath: string,
-	content: string,
-	tool: "create_note" | "append_to_note" | "update_note",
-): Promise<void> {
+async function putNoteToWrapper(env: Env, repoPath: string, content: string): Promise<void> {
 	const p = toWrapperPath(repoPath);
 	const res = await wrapperFetch(env, `/file?path=${encodeURIComponent(p)}`, {
 		method: "PUT",
-		headers: { "X-MCP-Tool": tool }, // 監査ログ(R2)用: どのツール経由の書き込みか
 		body: content,
 	});
 	if (!res.ok) throw new Error(`書き込みに失敗 (${res.status}): ${await res.text()}`);
@@ -85,7 +79,6 @@ async function deleteNoteFromWrapper(env: Env, repoPath: string): Promise<void> 
 	const p = toWrapperPath(repoPath);
 	const res = await wrapperFetch(env, `/file?path=${encodeURIComponent(p)}`, {
 		method: "DELETE",
-		headers: { "X-MCP-Tool": "delete_note" },
 	});
 	if (!res.ok) throw new Error(`削除に失敗 (${res.status}): ${await res.text()}`);
 }
@@ -118,107 +111,12 @@ async function resolveConflictOnWrapper(env: Env, repoPath: string, rev: string)
 	const p = toWrapperPath(repoPath);
 	const res = await wrapperFetch(env, `/resolve`, {
 		method: "POST",
-		headers: { "Content-Type": "application/json", "X-MCP-Tool": "resolve_conflict" },
+		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ path: p, rev }),
 	});
 	if (!res.ok) throw new Error(`コンフリクト解消に失敗 (${res.status}): ${await res.text()}`);
 	const data = (await res.json()) as { status: string; keptRev: string; output?: string };
 	return data.output ?? data.status;
-}
-/**note_move helper start*/
-/** 移動結果1件分(POST /move の results 要素) */
-type MoveResult = {
-	from: string;
-	to: string;
-	status: "planned" | "moved" | "skipped" | "error";
-	reason?: string;
-};
-
-/**
- * 複数ノートを移動する(POST /move)。dryRun=trueのときは計画だけ返して何も動かさない。
- * 移動はVPS内のfs操作で完結する(本文はここを通らない)。上書きはせず、移動先に同名があればskipped。
- */
-async function moveNotesOnWrapper(
-	env: Env,
-	moves: { from: string; to: string }[],
-	dryRun: boolean,
-): Promise<MoveResult[]> {
-	const res = await wrapperFetch(env, `/move`, {
-		method: "POST",
-		headers: { "Content-Type": "application/json", "X-MCP-Tool": "move_notes" },
-		body: JSON.stringify({
-			moves: moves.map((m) => ({ from: toWrapperPath(m.from), to: toWrapperPath(m.to) })),
-			dryRun,
-		}),
-	});
-	if (!res.ok) throw new Error(`移動に失敗 (${res.status}): ${await res.text()}`);
-	const data = (await res.json()) as { dryRun: boolean; results: MoveResult[] };
-	return data.results.map((r) => ({
-		...r,
-		from: fromWrapperPath(r.from),
-		to: fromWrapperPath(r.to),
-	}));
-}
-
-/** edit note helper */
-/** 部分編集1件分の結果(POST /edit の edits 要素) */
-type EditItemResult = {
-	status: "ok" | "error";
-	matches?: number;
-	lines?: number[];
-	reason?: string;
-};
-
-/** POST /edit のレスポンス */
-type EditNoteResult = {
-	path: string;
-	dryRun: boolean;
-	ok: boolean;
-	applied: boolean;
-	edits: EditItemResult[];
-	bytesBefore: number;
-	bytesAfter?: number;
-};
-
-/** wrapperのエラー応答({error: "..."})からメッセージを取り出す */
-async function readWrapperError(res: Response): Promise<string> {
-	const text = await res.text();
-	try {
-		const parsed = JSON.parse(text) as { error?: string };
-		return parsed.error ?? text;
-	} catch {
-		return text;
-	}
-}
-
-/**
- * ノートを部分編集する(POST /edit、str_replace方式)。
- * old_strがちょうど1か所に見つかるときだけ置換する。複数editは全部有効なときだけ一括適用(1つでもNGなら何も変更しない)。
- * 書き込みはVPS側で原子的に行い、同じノートへの同時編集は順番に処理される。
- */
-async function editNoteOnWrapper(
-	env: Env,
-	repoPath: string,
-	edits: { old_str: string; new_str: string; replace_all?: boolean }[],
-	dryRun: boolean,
-): Promise<EditNoteResult> {
-	const res = await wrapperFetch(env, `/edit`, {
-		method: "POST",
-		headers: { "Content-Type": "application/json", "X-MCP-Tool": "edit_note" },
-		body: JSON.stringify({
-			path: toWrapperPath(repoPath),
-			edits: edits.map((e) => ({
-				oldStr: e.old_str,
-				newStr: e.new_str,
-				replaceAll: e.replace_all === true,
-			})),
-			dryRun,
-		}),
-	});
-	if (res.status === 404) throw new Error(`${repoPath} が見つからへん。パス間違いかも。`);
-	if (!res.ok) throw new Error(`編集に失敗 (${res.status}): ${await readWrapperError(res)}`);
-	const data = (await res.json()) as EditNoteResult;
-	return { ...data, path: fromWrapperPath(data.path) };
 }
 
 /** Vault内の.mdファイルパス一覧を取得する(search_notes用) */
@@ -243,33 +141,6 @@ async function readFolderBulkFromWrapper(
 		.filter((f) => f.path.endsWith(".md"))
 		.map((f) => ({ path: fromWrapperPath(f.path), content: f.content }));
 }
-
-/** 追加 */
-type LsEntry = { path: string; type: "d" | "f"; size?: number; mtime?: string };
-
-/** Honoラッパーの /ls を叩く。prefixは "sige/..." でも "sige" でも可。返却パスには "sige/" を付け直す */
-async function listFolderOnWrapper(
-	env: Env,
-	prefix: string,
-	depth: number,
-	details: boolean,
-	limit: number,
-): Promise<{ count: number; truncated: boolean; entries: LsEntry[] }> {
-	const trimmed = prefix.replace(/\/+$/, "");
-	const p = trimmed === "sige" ? "" : toWrapperPath(trimmed);
-	const res = await wrapperFetch(
-		env,
-		`/ls?prefix=${encodeURIComponent(p)}&depth=${depth}&details=${details}&limit=${limit}`,
-	);
-	if (!res.ok) throw new Error(await readWrapperError(res));
-	const data = (await res.json()) as { count: number; truncated: boolean; entries: LsEntry[] };
-	return {
-		count: data.count,
-		truncated: data.truncated,
-		entries: data.entries.map((e) => ({ ...e, path: fromWrapperPath(e.path) })),
-	};
-}
-/** 追加end */
 
 /** 本文全文検索(サーバーサイド、VPS上のfsを直接検索するので高速・Vaultサイズ非依存) */
 async function searchNoteContentOnWrapper(
@@ -773,47 +644,6 @@ function createServer(env: Env) {
 		},
 	);
 
-//* 追加 */
-	server.registerTool(
-		"list_folder",
-		{
-			description:
-				"Obsidian Vault内のフォルダ構成を一覧する(フォルダが先、ファイルが後)。vaultの構造確認や整理作業向け。pathは'sige/'付きの相対パス(省略時はvaultルート)。details:trueでサイズと更新日時(JST)も付く。depthは1〜3、デフォルト1。limit超過時は打ち切られる。",
-			inputSchema: z.object({
-				path: z.string().optional().describe("対象フォルダ(例: 'sige/10_Projects')。省略時は'sige'"),
-				depth: z.number().int().min(1).max(3).optional().describe("掘る深さ(デフォルト1、最大3)"),
-				details: z.boolean().optional().describe("trueでサイズと更新日時を付ける(デフォルトfalse)"),
-				limit: z.number().int().min(1).max(500).optional().describe("最大件数(デフォルト200、最大500)"),
-			}),
-		},
-		async ({ path, depth, details, limit }) => {
-			try {
-				const base = path ?? "sige";
-				const d = depth ?? 1;
-				const r = await listFolderOnWrapper(env, base, d, details ?? false, limit ?? 200);
-				const fmtSize = (n: number) =>
-					n < 1024 ? `${n}B` : n < 1048576 ? `${(n / 1024).toFixed(1)}KB` : `${(n / 1048576).toFixed(1)}MB`;
-				const fmtTime = (iso: string) =>
-					new Date(new Date(iso).getTime() + 9 * 3600 * 1000).toISOString().slice(0, 16).replace("T", " ");
-				const lines = r.entries.map((e) => {
-					if (e.type === "d") return `d  ${e.path}/`;
-					const extra =
-						e.size !== undefined && e.mtime ? `  ${fmtSize(e.size)}  ${fmtTime(e.mtime)}` : "";
-					return `f  ${e.path}${extra}`;
-				});
-				const head = `# ${base} depth=${d} ${r.count}件${r.truncated ? "(上限で打ち切り。limitかpathを調整)" : ""}`;
-				return { content: [{ type: "text", text: [head, ...lines].join("\n") }] };
-			} catch (err) {
-				return {
-					content: [{ type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` }],
-					isError: true,
-				};
-			}
-		},
-	);
-//* 追加end */
-
-
 	//note search tools start
 
 	server.registerTool(
@@ -939,7 +769,7 @@ function createServer(env: Env) {
 						isError: true,
 					};
 				}
-				await putNoteToWrapper(env, path, content, "create_note");
+				await putNoteToWrapper(env, path, content);
 				return {
 					content: [{ type: "text", text: `作成した: ${path}` }],
 				};
@@ -985,7 +815,7 @@ function createServer(env: Env) {
 					};
 				}
 				const newContent = existing + (separator ?? "\n") + content;
-				await putNoteToWrapper(env, path, newContent, "append_to_note");
+				await putNoteToWrapper(env, path, newContent);
 				return {
 					content: [{ type: "text", text: `追記した: ${path}` }],
 				};
@@ -1023,7 +853,7 @@ function createServer(env: Env) {
 						isError: true,
 					};
 				}
-				await putNoteToWrapper(env, path, content, "update_note");
+				await putNoteToWrapper(env, path, content);
 				return {
 					content: [{ type: "text", text: `更新した: ${path}` }],
 				};
@@ -1143,141 +973,6 @@ function createServer(env: Env) {
 			}
 		},
 	);
-
-	/** move helper */
-	server.registerTool(
-		"move_notes",
-		{
-			description:
-				"Obsidian Vault内のノート(またはファイル)を別のパスへ移動する。1回で最大50件。必ず最初にdry_run: true(デフォルト)で計画を作り、内容をユーザーに見せて承認を取ってからdry_run: falseで実行すること。移動先に同名ファイルがある場合は上書きせずskippedになる。パス指定のリンク([[フォルダ/ノート]]等)の書き換えはしない。実行後にskippedやerrorがあれば、必ずユーザーに報告すること。",
-			inputSchema: z.object({
-				moves: z
-					.array(
-						z.object({
-							from: z
-								.string()
-								.describe("移動元のリポジトリルートからの相対パス(例: 'sige/00_Inbox/Clippings/A.md')"),
-							to: z
-								.string()
-								.describe(
-									"移動先のリポジトリルートからの相対パス。ファイル名まで含める(例: 'sige/30_Resources/料理レシピ/A.md')",
-								),
-						}),
-					)
-					.min(1)
-					.max(50)
-					.describe("移動の組のリスト(最大50件)"),
-				dry_run: z
-					.boolean()
-					.optional()
-					.describe("true(デフォルト)なら計画だけ返して何も動かさない。実際に移動するときだけfalseを指定"),
-			}),
-		},
-		async ({ moves, dry_run }) => {
-			try {
-				const dryRun = dry_run ?? true;
-				const results = await moveNotesOnWrapper(env, moves, dryRun);
-				const count = (s: MoveResult["status"]) => results.filter((r) => r.status === s).length;
-				return {
-					content: [
-						{
-							type: "text",
-							text: JSON.stringify(
-								{
-									dry_run: dryRun,
-									planned: count("planned"),
-									moved: count("moved"),
-									skipped: count("skipped"),
-									error: count("error"),
-									results,
-								},
-								null,
-								2,
-							),
-						},
-					],
-				};
-			} catch (err) {
-				return {
-					content: [
-						{ type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` },
-					],
-					isError: true,
-				};
-			}
-		},
-	);
-// move register end
-
-//note edit start
-server.registerTool(
-	"edit_note",
-	{
-		description:
-			"Obsidian Vault内の既存ノートを部分的に編集する(str_replace方式)。old_strがノート内にちょうど1か所だけ見つかる場合に、new_strへ置換する。0か所や複数か所の場合は何も変更せずエラーを返す(複数か所を意図して全部置換するときだけreplace_all: true)。editsを複数渡すと、すべて検証してから一括で適用し、1つでもNGなら何も変更しない。編集の前にread_noteで最新の内容を確認し、old_strは前後を含めて1か所に決まる長さにすること。frontmatterの1行や本文の一部のような小さな修正は、update_note(全文上書き)ではなくこのツールを使うこと。同じノートへの同時編集は順番に処理される。対象は.md/.txt/.canvas/.baseのみ。dry_run: trueで、変更せずに一致箇所(行番号)だけ確認できる。",
-		inputSchema: z.object({
-			path: z
-				.string()
-				.describe("編集対象ノートのリポジトリルートからの相対パス(例: 'sige/10_Projects/メモ.md')"),
-			edits: z
-				.array(
-					z.object({
-						old_str: z
-							.string()
-							.describe(
-								"置換前の文字列。ノート内にちょうど1か所だけ現れるよう、前後を含めた十分な長さにする。改行は\\nでよい",
-							),
-						new_str: z.string().describe("置換後の文字列。空文字にするとold_strを削除する"),
-						replace_all: z
-							.boolean()
-							.optional()
-							.describe("trueにすると、old_strの全出現箇所を置換する。意図して全部置換するときだけ指定"),
-					}),
-				)
-				.min(1)
-				.max(50)
-				.describe("編集のリスト(最大50件)。すべて元の内容に対して検証され、範囲が重なってはいけない"),
-			dry_run: z
-				.boolean()
-				.optional()
-				.describe("trueなら、変更せずに一致箇所(行番号)の確認だけをする。省略時はfalse(実際に編集する)"),
-		}),
-	},
-	async ({ path, edits, dry_run }) => {
-		try {
-			const dryRun = dry_run === true;
-			const r = await editNoteOnWrapper(env, path, edits, dryRun);
-			const summary = {
-				path: r.path,
-				dry_run: r.dryRun,
-				ok: r.ok,
-				applied: r.applied,
-				bytes_before: r.bytesBefore,
-				bytes_after: r.bytesAfter,
-				edits: r.edits,
-			};
-			if (!r.ok) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: `エラー: 編集できなかった(ノートは何も変更していない)\n${JSON.stringify(summary, null, 2)}`,
-						},
-					],
-					isError: true,
-				};
-			}
-			return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
-		} catch (err) {
-			return {
-				content: [
-					{ type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` },
-				],
-				isError: true,
-			};
-		}
-	},
-);
 
 	//note write tools end
 
