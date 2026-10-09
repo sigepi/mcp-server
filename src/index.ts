@@ -81,13 +81,21 @@ async function putNoteToWrapper(
 }
 
 /** ノートを削除する */
-async function deleteNoteFromWrapper(env: Env, repoPath: string): Promise<void> {
+/** R3: wrapper は削除をゴミ箱への移動にした。移動先(trashPath)と保持日数を返す(ゴミ箱内の完全削除では無い) */
+interface DeleteResult {
+	status?: string;
+	trashPath?: string;
+	keepDays?: number;
+}
+
+async function deleteNoteFromWrapper(env: Env, repoPath: string): Promise<DeleteResult> {
 	const p = toWrapperPath(repoPath);
 	const res = await wrapperFetch(env, `/file?path=${encodeURIComponent(p)}`, {
 		method: "DELETE",
 		headers: { "X-MCP-Tool": "delete_note" },
 	});
 	if (!res.ok) throw new Error(`削除に失敗 (${res.status}): ${await res.text()}`);
+	return ((await res.json().catch(() => ({}))) as DeleteResult) ?? {};
 }
 
 /** ノートのリビジョン・コンフリクト有無を取得する(check_conflicts用) */
@@ -1042,7 +1050,7 @@ function createServer(env: Env) {
 		"delete_note",
 		{
 			description:
-				"Obsidian Vault内の既存ノートを削除する。ノートが存在しない場合はエラーになる。削除は取り消せないので、確実に消したいノートのpathを指定すること。",
+				"Obsidian Vault内の既存ノートを削除する。実際にはゴミ箱(90_Archive/Trash/日付/元のパス)へ移動し、30日後に自動で完全削除される。それまでは move_notes で元の場所に戻せる。ゴミ箱の中のノートを指定すると、その場で完全削除する。ノートが存在しない場合はエラーになる。更新から3分未満のノートは、同期の安全のため削除できない(少し待って再実行)。",
 			inputSchema: z.object({
 				path: z.string().describe("削除対象ノートのリポジトリルートからの相対パス"),
 			}),
@@ -1057,9 +1065,12 @@ function createServer(env: Env) {
 						isError: true,
 					};
 				}
-				await deleteNoteFromWrapper(env, path);
+				const r = await deleteNoteFromWrapper(env, path);
+				const text = r.trashPath
+					? `ゴミ箱に移動した: ${path} → sige/${r.trashPath}(${r.keepDays ?? 30}日後に完全削除。戻すなら move_notes)`
+					: `完全削除した: ${path}`;
 				return {
-					content: [{ type: "text", text: `削除した: ${path}` }],
+					content: [{ type: "text", text }],
 				};
 			} catch (err) {
 				return {
