@@ -102,7 +102,7 @@ async function deleteNoteFromWrapper(env: Env, repoPath: string): Promise<Delete
 async function fetchNoteInfoFromWrapper(
 	env: Env,
 	repoPath: string,
-): Promise<{ path: string; size: number; mtime: string; revision?: string; conflicts?: string }> {
+): Promise<{ path: string; size: number; mtime: string; revision?: string; conflicts?: string; checked?: boolean; hasConflict?: boolean; conflictRevs?: string[]; deleted?: boolean; cliError?: string }> {
 	const p = toWrapperPath(repoPath);
 	const res = await wrapperFetch(env, `/info?path=${encodeURIComponent(p)}`);
 	if (res.status === 404) throw new Error(`ノートが見つからへんかった: ${repoPath}`);
@@ -113,6 +113,11 @@ async function fetchNoteInfoFromWrapper(
 		mtime: string;
 		revision?: string;
 		conflicts?: string;
+		checked?: boolean;
+		hasConflict?: boolean;
+		conflictRevs?: string[];
+		deleted?: boolean;
+		cliError?: string;
 	};
 	return { ...data, path: fromWrapperPath(data.path) };
 }
@@ -1095,7 +1100,11 @@ function createServer(env: Env) {
 		async ({ path }) => {
 			try {
 				const info = await fetchNoteInfoFromWrapper(env, path);
-				const hasConflict = !!info.conflicts && info.conflicts !== "N/A";
+				// checked !== true or no revision means we could not verify: never report no conflict
+				const verified = info.checked === true && !!info.revision;
+				const hasConflict: boolean | "unknown" = verified
+				  ? (info.hasConflict ?? (!!info.conflicts && info.conflicts !== "N/A"))
+				  : "unknown";
 				return {
 					content: [
 						{
@@ -1106,6 +1115,7 @@ function createServer(env: Env) {
 									revision: info.revision,
 									conflicts: info.conflicts,
 									has_conflict: hasConflict,
+									reason: hasConflict === "unknown" ? (info.cliError ?? "could not verify conflicts") : undefined,
 								},
 								null,
 								2,
