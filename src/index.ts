@@ -694,7 +694,7 @@ function createServer(env: Env) {
                 "read_note",
                 {
                         description:
-                                "Obsidian Vault内の指定パスのノート(Markdownファイル)を1本読み込む。pathはリポジトリルートからの相対パス(例: 'sige/daily/2026-08-12.md')。長いノートは head(先頭N行)か tail(末尾N行)で一部だけ読める(同時指定は不可)。切り詰めたときは末尾に全行数が付く。",
+                                "Obsidian Vault内の指定パスのノート(Markdownファイル)を1本読み込む。pathはリポジトリルートからの相対パス(例: 'sige/40_Synapse/デイリーノート/2026-08-12.md')。長いノートは head(先頭N行)か tail(末尾N行)で一部だけ読める(同時指定は不可)。切り詰めたときは末尾に全行数が付く。",
                         inputSchema: z.object({
                                 path: z.string().describe("リポジトリルートからの相対パス"),
                                 head: z.number().int().min(1).max(100000).optional().describe("先頭N行だけ読む。tailとは同時指定不可"),
@@ -871,7 +871,7 @@ function createServer(env: Env) {
                                 path_prefix: z
                                         .string()
                                         .optional()
-                                        .describe("この文字列で始まるパスのファイルだけを対象にする(例: 'sige/daily/')"),
+                                        .describe("この文字列で始まるパスのファイルだけを対象にする(例: 'sige/40_Synapse/デイリーノート/')"),
                         }),
                 },
                 async ({ query, path_prefix }) => {
@@ -917,7 +917,7 @@ function createServer(env: Env) {
                         description:
                                 "Obsidian Vault内に新規ノート(Markdownファイル)を作成する。同名のファイルが既にある場合はエラーになる(誤上書き防止のため)。既存ノートを変更したい場合はupdate_noteかappend_to_noteを使うこと。",
                         inputSchema: z.object({
-                                path: z.string().describe("作成するノートのリポジトリルートからの相対パス(例: 'sige/memo.md')"),
+                                path: z.string().describe("作成するノートのリポジトリルートからの相対パス(例: 'sige/00_Inbox/memo.md')"),
                                 content: z.string().describe("ノートの中身(Markdown本文)"),
                         }),
                 },
@@ -1082,7 +1082,7 @@ function createServer(env: Env) {
                                                 z.object({
                                                 from: z
                                                 .string()
-                                                .describe("移動元のリポジトリルートからの相対パス(例: 'sige/00_Inbox/Clippings/A.md')"),
+                                                .describe("移動元のリポジトリルートからの相対パス(例: 'sige/00_Inbox/Clip/A.md')"),
                                                 to: z
                                                 .string()
                                                 .describe(
