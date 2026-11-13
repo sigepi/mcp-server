@@ -1942,4 +1942,7 @@ export default new OAuthProvider({
         authorizeEndpoint: "/authorize",
         tokenEndpoint: "/token",
         clientRegistrationEndpoint: "/register",
+        // 動的登録クライアントはデフォルト90日で失効し、claude.ai側が古いclient_idを
+        // 持ったまま認証開始できなくなる。明示的にundefinedを渡して無期限にする。
+        clientRegistrationTTL: undefined,
 });
