@@ -69,7 +69,7 @@ async function putNoteToWrapper(
         env: Env,
         repoPath: string,
         content: string,
-        tool: "create_note" | "append_to_note" | "update_note",
+        tool: "create_note" | "append_to_note" | "update_note", // 監査ログ互換のため旧ツール名のまま(write_note の mode に対応)
 ): Promise<void> {
         const p = toWrapperPath(repoPath);
         const res = await wrapperFetch(env, `/file?path=${encodeURIComponent(p)}`, {
@@ -301,7 +301,7 @@ function calendarsBaseUrl(env: Env): string {
         return `${CALDAV_BASE}/${env.NEXTCLOUD_USERNAME}/`;
 }
 
-// 個別タスクリストのURL。idはlist_tasklistsで取得したhref末尾の部分。
+// 個別タスクリストのURL。idはlist_tasks(lists)で取得したhref末尾の部分。
 function taskCalendarUrl(env: Env, listId: string): string {
         return `${CALDAV_BASE}/${env.NEXTCLOUD_USERNAME}/${listId}/`;
 }
@@ -318,7 +318,7 @@ function escapeXml(s: string): string {
 /**
  * タスク/予定用のカレンダーコレクション一覧を取得する共通関数。
  * personal(予定)とcontact_birthdays、inbox/outbox/trashbin等の特殊コレクションは除外する。
- * list_tasklists と list_tasks(listId省略時) の両方から使う。
+ * list_tasks から使う(lists の返却とlistId省略時の全リスト取得)。
  */
 async function getTaskLists(env: Env): Promise<{ id: string; displayname: string }[]> {
         const body = `<?xml version="1.0" encoding="utf-8"?>
@@ -355,7 +355,7 @@ async function getTaskLists(env: Env): Promise<{ id: string; displayname: string
                         const idMatch = href.match(/calendars\/[^/]+\/([^/]+)\/?$/);
                         return {
                                 id: idMatch ? idMatch[1] : href,
-                                displayname: nameMatch ? nameMatch[1] : "(no name)",
+                                displayname: nameMatch ? decodeXmlEntities(nameMatch[1]) : "(no name)",
                         };
                 })
                 .filter((c) => c.id && c.id !== "personal" && c.id !== "contact_birthdays");
@@ -381,7 +381,7 @@ function buildVTODO(params: {
         description?: string;
         status?: "needs_action" | "in_process" | "completed";
 }): string {
-        const now = toICSDate(new Date().toISOString());
+        const now = nowICS();
         const statusMap: Record<string, string> = {
                 needs_action: "NEEDS-ACTION",
                 in_process: "IN-PROCESS",
@@ -397,7 +397,7 @@ function buildVTODO(params: {
                 "BEGIN:VTODO",
                 `UID:${params.uid}`,
                 `DTSTAMP:${now}`,
-                `SUMMARY:${params.summary}`,
+                `SUMMARY:${escapeICSText(params.summary)}`,
                 params.due ? `DUE:${toICSDate(params.due)}` : "",
                 params.priority && params.priority !== "none"
                         ? `PRIORITY:${PRIORITY_MAP[params.priority]}`
@@ -405,7 +405,7 @@ function buildVTODO(params: {
                 `STATUS:${status}`,
                 isCompleted ? `COMPLETED:${now}` : "",
                 isCompleted ? "PERCENT-COMPLETE:100" : "",
-                params.description ? `DESCRIPTION:${params.description}` : "",
+                params.description ? `DESCRIPTION:${escapeICSText(params.description)}` : "",
                 "END:VTODO",
                 "END:VCALENDAR",
         ]
@@ -413,22 +413,126 @@ function buildVTODO(params: {
                 .join("\r\n");
 }
 
-function parseVTODO(ics: string) {
-        const vtodoMatch = ics.match(/BEGIN:VTODO([\s\S]*?)END:VTODO/);
-        const body = vtodoMatch ? vtodoMatch[1] : ics;
-        const get = (key: string) => {
-                const m = body.match(new RegExp(`${key}(?:;[^:\\r\\n]*)?:(.*)`));
-                return m ? m[1].trim() : undefined;
+/**
+ * VTODO/VEVENT本体のプロパティを読む関数を返す。
+ * 折り返し行の連結、VTIMEZONE/VALARM等の同名プロパティの除外、行頭一致を行う。
+ * text=trueのときはTEXT値としてエスケープ(\n, \, 等)を戻す。
+ */
+function icsPropGetter(ics: string, comp: "VTODO" | "VEVENT") {
+        const unfolded = ics.replace(/\r?\n[ \t]/g, "");
+        const m = unfolded.match(new RegExp(`BEGIN:${comp}([\\s\\S]*?)END:${comp}`));
+        const body = (m ? m[1] : unfolded).replace(/BEGIN:(\w+)[\s\S]*?END:\1/g, "");
+        return (key: string, text = false) => {
+                const r = body.match(new RegExp(`^${key}(?:;[^:\\r\\n]*)?:(.*)$`, "m"));
+                if (!r) return undefined;
+                const v = r[1].trim();
+                return text ? unescapeICSText(v) : v;
         };
+}
+
+function parseVTODO(ics: string) {
+        const get = icsPropGetter(ics, "VTODO");
         const priorityRaw = get("PRIORITY");
         return {
                 uid: get("UID"),
-                summary: get("SUMMARY"),
+                summary: get("SUMMARY", true),
                 due: get("DUE"),
                 priority: priorityLabel(priorityRaw ? Number(priorityRaw) : undefined),
                 status: get("STATUS"),
-                description: get("DESCRIPTION"),
+                description: get("DESCRIPTION", true),
         };
+}
+
+/** CalDAVのXMLレスポンスから抜いた文字列の実体参照(&amp;等)を戻す */
+function decodeXmlEntities(s: string): string {
+        const named: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+        return s.replace(/&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos);/g, (m, e: string) => {
+                if (e[0] !== "#") return named[e];
+                const code = e[1] === "x" ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+                return Number.isNaN(code) ? m : String.fromCodePoint(code);
+        });
+}
+
+/** ICSのTEXT値のエスケープを戻す(\n→改行、\,→, など) */
+function unescapeICSText(s: string): string {
+        return s.replace(/\\([\\;,nN])/g, (_, c: string) => (c === "n" || c === "N" ? "\n" : c));
+}
+
+/** ICSのTEXT値をエスケープする(RFC5545 3.3.11) */
+function escapeICSText(s: string): string {
+        return s.replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r?\n/g, "\\n");
+}
+
+/**
+ * 既存VTODOのうち、指定された項目だけを書き換える(save_taskの更新用)。
+ * undefinedの項目は触らず、空文字はプロパティ削除。
+ * VALARM等の入れ子コンポーネント内の同名プロパティ(DESCRIPTION等)には触れない。
+ */
+function patchVTODO(
+        ics: string,
+        p: {
+                summary?: string;
+                due?: string;
+                priority?: "high" | "medium" | "low" | "none";
+                description?: string;
+                status?: "needs_action" | "in_process" | "completed";
+        },
+): string {
+        // 折り返し行(先頭が空白/タブ)を連結してから行単位で扱う
+        const lines = ics.replace(/\r?\n[ \t]/g, "").split(/\r?\n/);
+        const start = lines.findIndex((l) => l === "BEGIN:VTODO");
+        if (start < 0) throw new Error("既存データにVTODOが見つからへん。");
+
+        const set = new Map<string, string | null>(); // null = 削除
+        const now = nowICS();
+        if (p.summary !== undefined) set.set("SUMMARY", p.summary ? `SUMMARY:${escapeICSText(p.summary)}` : null);
+        if (p.due !== undefined) set.set("DUE", p.due ? `DUE:${toICSDate(p.due)}` : null);
+        if (p.priority !== undefined)
+                set.set("PRIORITY", p.priority === "none" ? null : `PRIORITY:${PRIORITY_MAP[p.priority]}`);
+        if (p.description !== undefined)
+                set.set("DESCRIPTION", p.description ? `DESCRIPTION:${escapeICSText(p.description)}` : null);
+        if (p.status !== undefined) {
+                const done = p.status === "completed";
+                set.set("STATUS", `STATUS:${{ needs_action: "NEEDS-ACTION", in_process: "IN-PROCESS", completed: "COMPLETED" }[p.status]}`);
+                set.set("COMPLETED", done ? `COMPLETED:${now}` : null);
+                set.set("PERCENT-COMPLETE", done ? "PERCENT-COMPLETE:100" : null);
+        }
+        set.set("DTSTAMP", `DTSTAMP:${now}`);
+        set.set("LAST-MODIFIED", `LAST-MODIFIED:${now}`);
+
+        const out: string[] = [];
+        let depth = 0; // VTODO直下=0、VALARM等の中=1以上
+        let end = -1;
+        let insertAt = -1; // 追加プロパティの挿入位置(最初の入れ子コンポーネントの前、なければEND:VTODOの前)
+        for (let i = 0; i < lines.length; i++) {
+                const l = lines[i];
+                if (i <= start || end >= 0) {
+                        out.push(l);
+                        continue;
+                }
+                if (depth === 0 && l === "END:VTODO") {
+                        end = out.length;
+                        out.push(l);
+                        continue;
+                }
+                if (l.startsWith("BEGIN:")) {
+                        if (depth === 0 && insertAt < 0) insertAt = out.length;
+                        depth++;
+                }
+                else if (l.startsWith("END:")) depth--;
+                const key = l.match(/^([A-Z-]+)[;:]/)?.[1];
+                if (depth === 0 && key && set.has(key)) continue; // 置き換え対象は一旦外す
+                out.push(l);
+        }
+        if (end < 0) throw new Error("既存データのVTODOが壊れている(END:VTODOなし)。");
+        const add = [...set.values()].filter((v): v is string => v !== null);
+        out.splice(insertAt >= 0 ? insertAt : end, 0, ...add);
+        return out.join("\r\n");
+}
+
+/** 現在時刻のUTC表記(toICSDateは入力をJSTとみなすので現在時刻には使えない) */
+function nowICS(): string {
+        return new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
 }
 
 function toICSDate(dateStr: string): string {
@@ -479,7 +583,7 @@ function buildICS(params: {
         end: string;
         description?: string;
 }): string {
-        const now = toICSDate(new Date().toISOString());
+        const now = nowICS();
         return [
                 "BEGIN:VCALENDAR",
                 "VERSION:2.0",
@@ -489,8 +593,8 @@ function buildICS(params: {
                 `DTSTAMP:${now}`,
                 `DTSTART:${toICSDate(params.start)}`,
                 `DTEND:${toICSDate(params.end)}`,
-                `SUMMARY:${params.summary}`,
-                params.description ? `DESCRIPTION:${params.description}` : "",
+                `SUMMARY:${escapeICSText(params.summary)}`,
+                params.description ? `DESCRIPTION:${escapeICSText(params.description)}` : "",
                 "END:VEVENT",
                 "END:VCALENDAR",
         ]
@@ -500,22 +604,14 @@ function buildICS(params: {
 
 // 超簡易ICSパーサー（一覧表示に必要な項目だけ抜く）
 function parseICS(ics: string) {
-        // VTIMEZONE内にも DTSTART 等の同名プロパティが出てくるため、
-        // VEVENT本体だけを切り出してからプロパティを拾う。
-        const veventMatch = ics.match(/BEGIN:VEVENT([\s\S]*?)END:VEVENT/);
-        const body = veventMatch ? veventMatch[1] : ics;
-
-        const get = (key: string) => {
-                // "KEY:value" と "KEY;PARAM=xxx:value" の両方に対応
-                const m = body.match(new RegExp(`${key}(?:;[^:\\r\\n]*)?:(.*)`));
-                return m ? m[1].trim() : undefined;
-        };
+        // VTIMEZONE内にも DTSTART 等の同名プロパティが出てくるため、VEVENT本体だけを見る
+        const get = icsPropGetter(ics, "VEVENT");
         return {
                 uid: get("UID"),
-                summary: get("SUMMARY"),
+                summary: get("SUMMARY", true),
                 start: get("DTSTART"),
                 end: get("DTEND"),
-                description: get("DESCRIPTION"),
+                description: get("DESCRIPTION", true),
         };
 }
 //calendar helpers end
@@ -815,91 +911,66 @@ function createServer(env: Env) {
                 "search_notes",
                 {
                         description:
-                                "Obsidian Vault内のノートをファイル名・パスで検索する。queryはファイル名やフォルダ名の一部(部分一致、大文字小文字区別なし)。本文の中身は見ない、パスだけの高速検索。",
+                                "Obsidian Vault内のノートを検索する。target:'path'(デフォルト)はファイル名・パスの部分一致(大文字小文字区別なし、本文は見ない高速検索)。target:'content'は本文の全文検索で、ヒットしたパスと前後の抜粋を返す。path_prefixで対象フォルダを絞れる(例: 'sige/40_Synapse/デイリーノート/')。",
                         inputSchema: z.object({
-                                query: z.string().describe("ファイル名/パスに含まれるキーワード"),
-                                limit: z
-                                        .number()
+                                query: z.string().describe("探すキーワード(pathならファイル名/パスの一部、contentなら本文中の語)"),
+                                target: z
+                                        .enum(["path", "content"])
                                         .optional()
-                                        .describe("最大何件返すか(デフォルト20)"),
-                        }),
-                },
-                async ({ query, limit }) => {
-                        try {
-                                const paths = await listVaultMarkdownPaths(env);
-                                const q = query.toLowerCase();
-                                const matched = paths.filter((p) => p.toLowerCase().includes(q));
-                                const capped = matched.slice(0, limit ?? 20);
-
-                                return {
-                                        content: [
-                                                {
-                                                type: "text",
-                                                text: JSON.stringify(
-                                                {
-                                                matched_count: matched.length,
-                                                returned_count: capped.length,
-                                                paths: capped,
-                                                },
-                                                null,
-                                                2,
-                                                ),
-                                                },
-                                        ],
-                                };
-                        } catch (err) {
-                                return {
-                                        content: [
-                                                {
-                                                type: "text",
-                                                text: `エラー: ${err instanceof Error ? err.message : String(err)}`,
-                                                },
-                                        ],
-                                        isError: true,
-                                };
-                        }
-                },
-        );
-
-        server.registerTool(
-                "search_note_content",
-                {
-                        description:
-                                "Obsidian Vault内のノートの本文中身を全文検索する。ヒットしたファイルのパスと前後の抜粋(スニペット)を返す。VPS上のfsを直接検索するので、Vaultサイズによる制限は実質ない。",
-                        inputSchema: z.object({
-                                query: z.string().describe("本文中で探すキーワード"),
+                                        .describe("'path'(デフォルト): ファイル名/パス検索、'content': 本文の全文検索"),
                                 path_prefix: z
                                         .string()
                                         .optional()
-                                        .describe("この文字列で始まるパスのファイルだけを対象にする(例: 'sige/40_Synapse/デイリーノート/')"),
+                                        .describe("この文字列で始まるパスのファイルだけを対象にする"),
+                                limit: z
+                                        .number()
+                                        .int()
+                                        .min(1)
+                                        .optional()
+                                        .describe("最大何件返すか(pathのデフォルト20、contentは省略時無制限)"),
                         }),
                 },
-                async ({ query, path_prefix }) => {
+                async ({ query, target, path_prefix, limit }) => {
                         try {
-                                const results = await searchNoteContentOnWrapper(env, query, path_prefix ?? "");
+                                if (target === "content") {
+                                        const results = await searchNoteContentOnWrapper(env, query, path_prefix ?? "");
+                                        const capped = limit ? results.slice(0, limit) : results;
+                                        return {
+                                                content: [
+                                                        {
+                                                                type: "text",
+                                                                text: JSON.stringify(
+                                                                        { hit_count: results.length, returned_count: capped.length, results: capped },
+                                                                        null,
+                                                                        2,
+                                                                ),
+                                                        },
+                                                ],
+                                        };
+                                }
 
+                                const paths = await listVaultMarkdownPaths(env);
+                                const q = query.toLowerCase();
+                                const matched = paths.filter(
+                                        (p) => (!path_prefix || p.startsWith(path_prefix)) && p.toLowerCase().includes(q),
+                                );
+                                const capped = matched.slice(0, limit ?? 20);
                                 return {
                                         content: [
                                                 {
-                                                type: "text",
-                                                text: JSON.stringify(
-                                                {
-                                                hit_count: results.length,
-                                                results,
-                                                },
-                                                null,
-                                                2,
-                                                ),
+                                                        type: "text",
+                                                        text: JSON.stringify(
+                                                                { matched_count: matched.length, returned_count: capped.length, paths: capped },
+                                                                null,
+                                                                2,
+                                                        ),
                                                 },
                                         ],
                                 };
                         } catch (err) {
                                 return {
                                         content: [
-                                                {
-                                                type: "text",
-                                                text: `エラー: ${err instanceof Error ? err.message : String(err)}`,
-                                                },
+                                                { type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` },
                                         ],
                                         isError: true,
                                 };
@@ -912,123 +983,55 @@ function createServer(env: Env) {
         //note write tools start
 
         server.registerTool(
-                "create_note",
+                "write_note",
                 {
                         description:
-                                "Obsidian Vault内に新規ノート(Markdownファイル)を作成する。同名のファイルが既にある場合はエラーになる(誤上書き防止のため)。既存ノートを変更したい場合はupdate_noteかappend_to_noteを使うこと。",
+                                "Obsidian Vaultのノート(Markdown)を書き込む。mode:'create'(デフォルト)は新規作成で、同名ファイルがあればエラー(誤上書き防止)。mode:'append'は既存ノートの末尾に追記。mode:'overwrite'は既存ノートを全文上書き。append/overwriteはノートが無いとエラー。一部だけ直すならoverwriteではなくedit_noteを使うこと。",
                         inputSchema: z.object({
-                                path: z.string().describe("作成するノートのリポジトリルートからの相対パス(例: 'sige/00_Inbox/memo.md')"),
-                                content: z.string().describe("ノートの中身(Markdown本文)"),
-                        }),
-                },
-                async ({ path, content }) => {
-                        try {
-                                if (await noteExistsOnWrapper(env, path)) {
-                                        return {
-                                                content: [
-                                                {
-                                                type: "text",
-                                                text: `エラー: ${path} は既に存在する。上書きしたいならupdate_note、追記したいならappend_to_noteを使って。`,
-                                                },
-                                                ],
-                                                isError: true,
-                                        };
-                                }
-                                await putNoteToWrapper(env, path, content, "create_note");
-                                return {
-                                        content: [{ type: "text", text: `作成した: ${path}` }],
-                                };
-                        } catch (err) {
-                                return {
-                                        content: [
-                                                { type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` },
-                                        ],
-                                        isError: true,
-                                };
-                        }
-                },
-        );
-
-        server.registerTool(
-                "append_to_note",
-                {
-                        description:
-                                "既存ノートの末尾にテキストを追記する。ノートが存在しない場合はエラーになるので、先にcreate_noteで作成すること。",
-                        inputSchema: z.object({
-                                path: z.string().describe("追記対象ノートのリポジトリルートからの相対パス"),
-                                content: z.string().describe("追記するテキスト"),
+                                path: z.string().describe("ノートのリポジトリルートからの相対パス(例: 'sige/00_Inbox/memo.md')"),
+                                content: z.string().describe("書き込む内容(create/overwriteは全文、appendは追記分)"),
+                                mode: z
+                                        .enum(["create", "append", "overwrite"])
+                                        .optional()
+                                        .describe("'create'(デフォルト) / 'append' / 'overwrite'"),
                                 separator: z
                                         .string()
                                         .optional()
-                                        .describe("既存本文と追記内容の間に挟む文字列(デフォルトは改行1つ '\\n')"),
+                                        .describe("appendのとき既存本文と追記の間に挟む文字列(デフォルトは改行1つ '\\n')"),
                         }),
                 },
-                async ({ path, content, separator }) => {
+                async ({ path, content, mode, separator }) => {
+                        const m = mode ?? "create";
+                        const fail = (text: string) => ({ content: [{ type: "text" as const, text }], isError: true });
                         try {
-                                let existing: string;
-                                try {
-                                        existing = await fetchNoteFromWrapper(env, path);
-                                } catch {
-                                        return {
-                                                content: [
-                                                {
-                                                type: "text",
-                                                text: `エラー: ${path} が見つからへん。先にcreate_noteで作成して。`,
-                                                },
-                                                ],
-                                                isError: true,
-                                        };
+                                if (m === "create") {
+                                        if (await noteExistsOnWrapper(env, path)) {
+                                                return fail(
+                                                        `エラー: ${path} は既に存在する。上書きならmode:'overwrite'、追記ならmode:'append'、一部修正ならedit_noteを使って。`,
+                                                );
+                                        }
+                                        await putNoteToWrapper(env, path, content, "create_note");
+                                        return { content: [{ type: "text", text: `作成した: ${path}` }] };
                                 }
-                                const newContent = existing + (separator ?? "\n") + content;
-                                await putNoteToWrapper(env, path, newContent, "append_to_note");
-                                return {
-                                        content: [{ type: "text", text: `追記した: ${path}` }],
-                                };
-                        } catch (err) {
-                                return {
-                                        content: [
-                                                { type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` },
-                                        ],
-                                        isError: true,
-                                };
-                        }
-                },
-        );
 
-        server.registerTool(
-                "update_note",
-                {
-                        description:
-                                "既存ノートの中身を丸ごと上書きする。ノートが存在しない場合はエラーになるので、先にcreate_noteで作成すること。部分的な変更をしたい場合は事前にread_noteで現在の中身を取得し、変更後の全文をcontentに渡すこと。",
-                        inputSchema: z.object({
-                                path: z.string().describe("上書き対象ノートのリポジトリルートからの相対パス"),
-                                content: z.string().describe("新しいノートの中身(全文、Markdown)"),
-                        }),
-                },
-                async ({ path, content }) => {
-                        try {
+                                if (m === "append") {
+                                        let existing: string;
+                                        try {
+                                                existing = await fetchNoteFromWrapper(env, path);
+                                        } catch {
+                                                return fail(`エラー: ${path} が見つからへん。先にmode:'create'で作成して。`);
+                                        }
+                                        await putNoteToWrapper(env, path, existing + (separator ?? "\n") + content, "append_to_note");
+                                        return { content: [{ type: "text", text: `追記した: ${path}` }] };
+                                }
+
                                 if (!(await noteExistsOnWrapper(env, path))) {
-                                        return {
-                                                content: [
-                                                {
-                                                type: "text",
-                                                text: `エラー: ${path} が見つからへん。先にcreate_noteで作成して。`,
-                                                },
-                                                ],
-                                                isError: true,
-                                        };
+                                        return fail(`エラー: ${path} が見つからへん。先にmode:'create'で作成して。`);
                                 }
                                 await putNoteToWrapper(env, path, content, "update_note");
-                                return {
-                                        content: [{ type: "text", text: `更新した: ${path}` }],
-                                };
+                                return { content: [{ type: "text", text: `上書きした: ${path}` }] };
                         } catch (err) {
-                                return {
-                                        content: [
-                                                { type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` },
-                                        ],
-                                        isError: true,
-                                };
+                                return fail(`エラー: ${err instanceof Error ? err.message : String(err)}`);
                         }
                 },
         );
@@ -1140,7 +1143,7 @@ server.registerTool(
         "edit_note",
         {
                 description:
-                        "Obsidian Vault内の既存ノートを部分的に編集する(str_replace方式)。old_strがノート内にちょうど1か所だけ見つかる場合に、new_strへ置換する。0か所や複数か所の場合は何も変更せずエラーを返す(複数か所を意図して全部置換するときだけreplace_all: true)。editsを複数渡すと、すべて検証してから一括で適用し、1つでもNGなら何も変更しない。編集の前にread_noteで最新の内容を確認し、old_strは前後を含めて1か所に決まる長さにすること。frontmatterの1行や本文の一部のような小さな修正は、update_note(全文上書き)ではなくこのツールを使うこと。同じノートへの同時編集は順番に処理される。対象は.md/.txt/.canvas/.baseのみ。dry_run: trueで、変更せずに一致箇所(行番号)だけ確認できる。",
+                        "Obsidian Vault内の既存ノートを部分的に編集する(str_replace方式)。old_strがノート内にちょうど1か所だけ見つかる場合に、new_strへ置換する。0か所や複数か所の場合は何も変更せずエラーを返す(複数か所を意図して全部置換するときだけreplace_all: true)。editsを複数渡すと、すべて検証してから一括で適用し、1つでもNGなら何も変更しない。編集の前にread_noteで最新の内容を確認し、old_strは前後を含めて1か所に決まる長さにすること。frontmatterの1行や本文の一部のような小さな修正は、write_note(mode:'overwrite')ではなくこのツールを使うこと。同じノートへの同時編集は順番に処理される。対象は.md/.txt/.canvas/.baseのみ。dry_run: trueで、変更せずに一致箇所(行番号)だけ確認できる。",
                 inputSchema: z.object({
                         path: z
                                 .string()
@@ -1352,7 +1355,7 @@ server.registerTool(
                                 const matches = [
                                         ...xml.matchAll(/<[\w-]+:calendar-data[^>]*>([\s\S]*?)<\/[\w-]+:calendar-data>/g),
                                 ];
-                                const events = matches.map((m) => parseICS(m[1]));
+                                const events = matches.map((m) => parseICS(decodeXmlEntities(m[1])));
 
                                 return {
                                         content: [{ type: "text", text: JSON.stringify(events, null, 2) }],
@@ -1369,79 +1372,44 @@ server.registerTool(
         );
 
         server.registerTool(
-                "create_calendar_event",
+                "save_calendar_event",
                 {
-                        description: "Nextcloudカレンダーに新しい予定を作成する。",
+                        description:
+                                "Nextcloudカレンダーの予定を作成または更新する。uidを省略すると新規作成、uid(list_calendar_eventsで取得)を指定するとその予定を更新する。更新は全項目上書きなので、変えない項目も現在の値を渡すこと。",
                         inputSchema: z.object({
+                                uid: z.string().optional().describe("更新対象のUID。省略時は新規作成"),
                                 summary: z.string().describe("予定のタイトル"),
                                 start: z.string().describe("開始日時 (日本時間/JST, 例: 2026-08-14T11:00:00)"),
                                 end: z.string().describe("終了日時 (日本時間/JST, 例: 2026-08-14T12:00:00)"),
                                 description: z.string().optional().describe("予定の詳細メモ"),
                         }),
                 },
-                async ({ summary, start, end, description }) => {
-                        try {
-                                const uid = crypto.randomUUID();
-                                const ics = buildICS({ uid, summary, start, end, description });
-
-                                const res = await fetch(`${calendarUrl(env)}${uid}.ics`, {
-                                        method: "PUT",
-                                        headers: {
-                                                Authorization: authHeader(env),
-                                                "Content-Type": "text/calendar; charset=utf-8",
-                                        },
-                                        body: ics,
-                                });
-
-                                if (!res.ok) {
-                                        throw new Error(`作成に失敗: ${res.status} ${await res.text()}`);
-                                }
-
-                                return {
-                                        content: [{ type: "text", text: `予定を作成した。UID: ${uid}` }],
-                                };
-                        } catch (err) {
-                                return {
-                                        content: [
-                                                { type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` },
-                                        ],
-                                        isError: true,
-                                };
-                        }
-                },
-        );
-
-        server.registerTool(
-                "update_calendar_event",
-                {
-                        description: "既存のNextcloudカレンダー予定をUID指定で更新する(内容は全項目上書き)。",
-                        inputSchema: z.object({
-                                uid: z.string().describe("変更対象イベントのUID (list_calendar_eventsで取得したもの)"),
-                                summary: z.string().describe("予定のタイトル(変更後)"),
-                                start: z.string().describe("開始日時 (日本時間/JST, 変更後, 例: 2026-08-14T11:00:00)"),
-                                end: z.string().describe("終了日時 (日本時間/JST, 変更後, 例: 2026-08-14T12:00:00)"),
-                                description: z.string().optional().describe("予定の詳細メモ(変更後)"),
-                        }),
-                },
                 async ({ uid, summary, start, end, description }) => {
                         try {
-                                const ics = buildICS({ uid, summary, start, end, description });
+                                const isNew = !uid;
+                                const id = uid ?? crypto.randomUUID();
+                                const ics = buildICS({ uid: id, summary, start, end, description });
 
-                                const res = await fetch(`${calendarUrl(env)}${uid}.ics`, {
+                                const res = await fetch(`${calendarUrl(env)}${id}.ics`, {
                                         method: "PUT",
                                         headers: {
                                                 Authorization: authHeader(env),
                                                 "Content-Type": "text/calendar; charset=utf-8",
+                                                // 新規はUIDの衝突防止、更新は存在しない予定を勝手に作らない
+                                                ...(isNew ? { "If-None-Match": "*" } : { "If-Match": "*" }),
                                         },
                                         body: ics,
                                 });
 
+                                if (res.status === 412 && !isNew) {
+                                        throw new Error(`UID ${id} の予定が見つからへん。list_calendar_eventsで確認して。`);
+                                }
                                 if (!res.ok) {
-                                        throw new Error(`更新に失敗: ${res.status} ${await res.text()}`);
+                                        throw new Error(`${isNew ? "作成" : "更新"}に失敗: ${res.status} ${await res.text()}`);
                                 }
 
                                 return {
-                                        content: [{ type: "text", text: `予定を更新した。UID: ${uid}` }],
+                                        content: [{ type: "text", text: `予定を${isNew ? "作成" : "更新"}した。UID: ${id}` }],
                                 };
                         } catch (err) {
                                 return {
@@ -1491,182 +1459,15 @@ server.registerTool(
 
         //calendar tools end
 
-        //task list management tools start
-
-        server.registerTool(
-                "list_tasklists",
-                {
-                        description:
-                                "Nextcloud上のタスクリスト(カレンダーコレクション)を一覧取得する。id(不変の識別子)とdisplayname(表示名)を返す。他のタスク系ツールにはこのidを渡す。",
-                        inputSchema: z.object({}),
-                },
-                async () => {
-                        try {
-                                const calendars = await getTaskLists(env);
-                                return {
-                                        content: [{ type: "text", text: JSON.stringify(calendars, null, 2) }],
-                                };
-                        } catch (err) {
-                                return {
-                                        content: [
-                                                { type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` },
-                                        ],
-                                        isError: true,
-                                };
-                        }
-                },
-        );
-
-        server.registerTool(
-                "create_task_list",
-                {
-                        description: "新しいタスクリスト(カレンダーコレクション)を作成する。",
-                        inputSchema: z.object({
-                                displayname: z.string().describe("リストの表示名 (例: 買い物, 仕事)"),
-                        }),
-                },
-                async ({ displayname }) => {
-                        try {
-                                const id = crypto.randomUUID();
-                                // Cloudflare Workersのfetch()はMKCALENDARメソッドを受け付けないため、
-                                // RFC5689 (Extended MKCOL) に従い、標準のMKCOLメソッド+ボディでresourcetypeに
-                                // calendarを含めることでカレンダーコレクションを作成する(SabreDAV/Nextcloudが対応)。
-                                const body = `<?xml version="1.0" encoding="utf-8"?>
-<d:mkcol xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:set>
-    <d:prop>
-      <d:resourcetype>
-        <d:collection/>
-        <c:calendar/>
-      </d:resourcetype>
-      <d:displayname>${escapeXml(displayname)}</d:displayname>
-      <c:supported-calendar-component-set>
-        <c:comp name="VTODO"/>
-      </c:supported-calendar-component-set>
-    </d:prop>
-  </d:set>
-</d:mkcol>`;
-
-                                const res = await fetch(`${calendarsBaseUrl(env)}${id}/`, {
-                                        method: "MKCOL",
-                                        headers: {
-                                                Authorization: authHeader(env),
-                                                "Content-Type": "application/xml; charset=utf-8",
-                                        },
-                                        body,
-                                });
-                                if (!res.ok) {
-                                        throw new Error(`作成に失敗: ${res.status} ${await res.text()}`);
-                                }
-
-                                return {
-                                        content: [
-                                                { type: "text", text: `タスクリスト「${displayname}」を作成した。id: ${id}` },
-                                        ],
-                                };
-                        } catch (err) {
-                                return {
-                                        content: [
-                                                { type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` },
-                                        ],
-                                        isError: true,
-                                };
-                        }
-                },
-        );
-
-        server.registerTool(
-                "rename_task_list",
-                {
-                        description: "既存タスクリストの表示名を変更する。idはlist_tasklistsで取得したものを使う。",
-                        inputSchema: z.object({
-                                id: z.string().describe("対象リストのid (list_tasklistsのidフィールド)"),
-                                new_displayname: z.string().describe("変更後の表示名"),
-                        }),
-                },
-                async ({ id, new_displayname }) => {
-                        try {
-                                const body = `<?xml version="1.0" encoding="utf-8"?>
-<d:propertyupdate xmlns:d="DAV:">
-  <d:set>
-    <d:prop>
-      <d:displayname>${escapeXml(new_displayname)}</d:displayname>
-    </d:prop>
-  </d:set>
-</d:propertyupdate>`;
-
-                                const res = await fetch(`${calendarsBaseUrl(env)}${id}/`, {
-                                        method: "PROPPATCH",
-                                        headers: {
-                                                Authorization: authHeader(env),
-                                                "Content-Type": "application/xml; charset=utf-8",
-                                        },
-                                        body,
-                                });
-                                if (!res.ok) {
-                                        throw new Error(`改名に失敗: ${res.status} ${await res.text()}`);
-                                }
-
-                                return {
-                                        content: [{ type: "text", text: `表示名を「${new_displayname}」に変更した。` }],
-                                };
-                        } catch (err) {
-                                return {
-                                        content: [
-                                                { type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` },
-                                        ],
-                                        isError: true,
-                                };
-                        }
-                },
-        );
-
-        server.registerTool(
-                "delete_task_list",
-                {
-                        description:
-                                "タスクリストを削除する。中のタスクも全て消える破壊的操作なので、実行前に必ずユーザーに確認すること。",
-                        inputSchema: z.object({
-                                id: z.string().describe("削除対象リストのid (list_tasklistsのidフィールド)"),
-                        }),
-                },
-                async ({ id }) => {
-                        try {
-                                const res = await fetch(`${calendarsBaseUrl(env)}${id}/`, {
-                                        method: "DELETE",
-                                        headers: { Authorization: authHeader(env) },
-                                });
-                                if (!res.ok && res.status !== 404) {
-                                        throw new Error(`削除に失敗: ${res.status} ${await res.text()}`);
-                                }
-                                return {
-                                        content: [{ type: "text", text: `タスクリストを削除した。id: ${id}` }],
-                                };
-                        } catch (err) {
-                                return {
-                                        content: [
-                                                { type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` },
-                                        ],
-                                        isError: true,
-                                };
-                        }
-                },
-        );
-
-        //task list management tools end
-
         //task tools start
 
         server.registerTool(
                 "list_tasks",
                 {
                         description:
-                                "タスク(リマインダー)一覧を取得する。listId未指定時は全リストから取得する。",
+                                "Nextcloudのタスク(リマインダー)を取得する。返り値のlistsにタスクリスト一覧(id/displayname)、tasksにタスクが入る。他のタスク系ツールにはこのlistのidを渡す。listId省略時は全リストから取得。",
                         inputSchema: z.object({
-                                listId: z
-                                        .string()
-                                        .optional()
-                                        .describe("対象リストのid (list_tasklistsのidフィールド)。省略時は全リスト"),
+                                listId: z.string().optional().describe("対象リストのid。省略時は全リスト"),
                                 include_completed: z
                                         .boolean()
                                         .optional()
@@ -1675,7 +1476,8 @@ server.registerTool(
                 },
                 async ({ listId, include_completed }) => {
                         try {
-                                const targets = listId ? [listId] : (await getTaskLists(env)).map((c) => c.id);
+                                const lists = await getTaskLists(env);
+                                const targets = listId ? [listId] : lists.map((c) => c.id);
 
                                 const body = `<?xml version="1.0" encoding="utf-8" ?>
 <c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
@@ -1690,14 +1492,14 @@ server.registerTool(
   </c:filter>
 </c:calendar-query>`;
 
-                                const allTasks: any[] = [];
+                                const tasks: any[] = [];
                                 for (const id of targets) {
                                         const res = await fetch(taskCalendarUrl(env, id), {
                                                 method: "REPORT",
                                                 headers: {
-                                                Authorization: authHeader(env),
-                                                "Content-Type": "application/xml; charset=utf-8",
-                                                Depth: "1",
+                                                        Authorization: authHeader(env),
+                                                        "Content-Type": "application/xml; charset=utf-8",
+                                                        Depth: "1",
                                                 },
                                                 body,
                                         });
@@ -1707,14 +1509,14 @@ server.registerTool(
                                                 ...xml.matchAll(/<[\w-]+:calendar-data[^>]*>([\s\S]*?)<\/[\w-]+:calendar-data>/g),
                                         ];
                                         for (const m of matches) {
-                                                const task = parseVTODO(m[1]);
+                                                const task = parseVTODO(decodeXmlEntities(m[1]));
                                                 if (!include_completed && task.status === "COMPLETED") continue;
-                                                allTasks.push({ listId: id, ...task });
+                                                tasks.push({ listId: id, ...task });
                                         }
                                 }
 
                                 return {
-                                        content: [{ type: "text", text: JSON.stringify(allTasks, null, 2) }],
+                                        content: [{ type: "text", text: JSON.stringify({ lists, tasks }, null, 2) }],
                                 };
                         } catch (err) {
                                 return {
@@ -1728,155 +1530,73 @@ server.registerTool(
         );
 
         server.registerTool(
-                "create_task",
+                "save_task",
                 {
-                        description: "指定リストに新しいタスク(リマインダー)を作成する。",
+                        description:
+                                "Nextcloudのタスクを作成または更新する。uidを省略すると新規作成(summary必須)。uid(list_tasksで取得)を指定すると、渡した項目だけを変更し、他は保持する。完了にするにはstatus:'completed'、未完了に戻すにはstatus:'needs_action'。dueやdescriptionを消すには空文字を渡す。",
                         inputSchema: z.object({
-                                listId: z.string().describe("作成先リストのid (list_tasklistsのidフィールド)"),
-                                summary: z.string().describe("タスクのタイトル"),
+                                listId: z.string().describe("リストのid (list_tasksのlists[].id)"),
+                                uid: z.string().optional().describe("更新対象タスクのUID。省略時は新規作成"),
+                                summary: z.string().optional().describe("タスクのタイトル(新規作成時は必須)"),
                                 due: z
                                         .string()
                                         .optional()
-                                        .describe("期限日時 (日本時間/JST, 例: 2026-08-20T09:00:00)"),
-                                priority: z
-                                        .enum(["high", "medium", "low", "none"])
+                                        .describe("期限日時 (日本時間/JST, 例: 2026-08-20T09:00:00)。空文字で期限を削除"),
+                                priority: z.enum(["high", "medium", "low", "none"]).optional().describe("緊急度"),
+                                description: z.string().optional().describe("メモ。空文字で削除"),
+                                status: z
+                                        .enum(["needs_action", "in_process", "completed"])
                                         .optional()
-                                        .describe("緊急度"),
-                                description: z.string().optional().describe("メモ"),
+                                        .describe("状態。'completed'で完了扱い"),
                         }),
                 },
-                async ({ listId, summary, due, priority, description }) => {
+                async ({ listId, uid, summary, due, priority, description, status }) => {
                         try {
-                                const uid = crypto.randomUUID();
-                                const ics = buildVTODO({ uid, summary, due, priority, description });
-
-                                const res = await fetch(`${taskCalendarUrl(env, listId)}${uid}.ics`, {
-                                        method: "PUT",
-                                        headers: {
-                                                Authorization: authHeader(env),
-                                                "Content-Type": "text/calendar; charset=utf-8",
-                                        },
-                                        body: ics,
-                                });
-                                if (!res.ok) {
-                                        throw new Error(`作成に失敗: ${res.status} ${await res.text()}`);
+                                if (!uid) {
+                                        if (!summary) throw new Error("新規作成にはsummaryが必要。");
+                                        const newUid = crypto.randomUUID();
+                                        const ics = buildVTODO({
+                                                uid: newUid,
+                                                summary,
+                                                due: due || undefined,
+                                                priority,
+                                                description: description || undefined,
+                                                status,
+                                        });
+                                        const res = await fetch(`${taskCalendarUrl(env, listId)}${newUid}.ics`, {
+                                                method: "PUT",
+                                                headers: {
+                                                        Authorization: authHeader(env),
+                                                        "Content-Type": "text/calendar; charset=utf-8",
+                                                        "If-None-Match": "*",
+                                                },
+                                                body: ics,
+                                        });
+                                        if (!res.ok) throw new Error(`作成に失敗: ${res.status} ${await res.text()}`);
+                                        return { content: [{ type: "text", text: `タスクを作成した。UID: ${newUid}` }] };
                                 }
 
-                                return {
-                                        content: [{ type: "text", text: `タスクを作成した。UID: ${uid}` }],
-                                };
-                        } catch (err) {
-                                return {
-                                        content: [
-                                                { type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` },
-                                        ],
-                                        isError: true,
-                                };
-                        }
-                },
-        );
-
-        server.registerTool(
-                "update_task",
-                {
-                        description: "既存タスクをUID指定で更新する(内容は全項目上書き)。",
-                        inputSchema: z.object({
-                                listId: z.string().describe("対象リストのid"),
-                                uid: z.string().describe("変更対象タスクのUID (list_tasksで取得したもの)"),
-                                summary: z.string().describe("タスクのタイトル(変更後)"),
-                                due: z.string().optional().describe("期限日時 (日本時間/JST, 変更後)"),
-                                priority: z
-                                        .enum(["high", "medium", "low", "none"])
-                                        .optional()
-                                        .describe("緊急度(変更後)"),
-                                description: z.string().optional().describe("メモ(変更後)"),
-                        }),
-                },
-                async ({ listId, uid, summary, due, priority, description }) => {
-                        try {
-                                const ics = buildVTODO({ uid, summary, due, priority, description });
-
-                                const res = await fetch(`${taskCalendarUrl(env, listId)}${uid}.ics`, {
-                                        method: "PUT",
-                                        headers: {
-                                                Authorization: authHeader(env),
-                                                "Content-Type": "text/calendar; charset=utf-8",
-                                        },
-                                        body: ics,
-                                });
-                                if (!res.ok) {
-                                        throw new Error(`更新に失敗: ${res.status} ${await res.text()}`);
-                                }
-
-                                return {
-                                        content: [{ type: "text", text: `タスクを更新した。UID: ${uid}` }],
-                                };
-                        } catch (err) {
-                                return {
-                                        content: [
-                                                { type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` },
-                                        ],
-                                        isError: true,
-                                };
-                        }
-                },
-        );
-
-        server.registerTool(
-                "complete_task",
-                {
-                        description: "タスクを完了済みにする(他の項目は保持したまま)。",
-                        inputSchema: z.object({
-                                listId: z.string().describe("対象リストのid"),
-                                uid: z.string().describe("完了にするタスクのUID"),
-                        }),
-                },
-                async ({ listId, uid }) => {
-                        try {
                                 const url = `${taskCalendarUrl(env, listId)}${uid}.ics`;
-                                const getRes = await fetch(url, {
-                                        method: "GET",
-                                        headers: { Authorization: authHeader(env) },
-                                });
-                                if (!getRes.ok) {
-                                        throw new Error(`取得に失敗: ${getRes.status} ${await getRes.text()}`);
-                                }
-                                let ics = await getRes.text();
-                                const now = toICSDate(new Date().toISOString());
-
-                                // 既存ICSのSTATUS/PERCENT-COMPLETE/COMPLETED行だけを置換し、
-                                // DUEやPRIORITY等の他のプロパティは一切いじらない
-                                if (/STATUS:.*/.test(ics)) {
-                                        ics = ics.replace(/STATUS:.*/, "STATUS:COMPLETED");
-                                } else {
-                                        ics = ics.replace("END:VTODO", "STATUS:COMPLETED\r\nEND:VTODO");
-                                }
-                                if (/PERCENT-COMPLETE:.*/.test(ics)) {
-                                        ics = ics.replace(/PERCENT-COMPLETE:.*/, "PERCENT-COMPLETE:100");
-                                } else {
-                                        ics = ics.replace("END:VTODO", "PERCENT-COMPLETE:100\r\nEND:VTODO");
-                                }
-                                if (/COMPLETED:.*/.test(ics)) {
-                                        ics = ics.replace(/COMPLETED:.*/, `COMPLETED:${now}`);
-                                } else {
-                                        ics = ics.replace("END:VTODO", `COMPLETED:${now}\r\nEND:VTODO`);
-                                }
+                                const getRes = await fetch(url, { method: "GET", headers: { Authorization: authHeader(env) } });
+                                if (getRes.status === 404) throw new Error(`UID ${uid} のタスクが見つからへん。listIdとuidを確認して。`);
+                                if (!getRes.ok) throw new Error(`取得に失敗: ${getRes.status} ${await getRes.text()}`);
+                                const etag = getRes.headers.get("ETag");
+                                const ics = patchVTODO(await getRes.text(), { summary, due, priority, description, status });
 
                                 const putRes = await fetch(url, {
                                         method: "PUT",
                                         headers: {
                                                 Authorization: authHeader(env),
                                                 "Content-Type": "text/calendar; charset=utf-8",
+                                                // 読んでから書くまでに他所で変更されていたら上書きしない
+                                                ...(etag ? { "If-Match": etag } : {}),
                                         },
                                         body: ics,
                                 });
-                                if (!putRes.ok) {
-                                        throw new Error(`完了処理に失敗: ${putRes.status} ${await putRes.text()}`);
-                                }
+                                if (putRes.status === 412) throw new Error("取得後にタスクが他で変更された。もう一度実行して。");
+                                if (!putRes.ok) throw new Error(`更新に失敗: ${putRes.status} ${await putRes.text()}`);
 
-                                return {
-                                        content: [{ type: "text", text: `タスクを完了にした。UID: ${uid}` }],
-                                };
+                                return { content: [{ type: "text", text: `タスクを更新した。UID: ${uid}` }] };
                         } catch (err) {
                                 return {
                                         content: [
@@ -1921,6 +1641,119 @@ server.registerTool(
         );
 
         //task tools end
+
+        //task list management tools start
+
+        server.registerTool(
+                "manage_task_list",
+                {
+                        description:
+                                "タスクリストを作成または改名する。action:'create'はdisplaynameで新規作成。action:'rename'はid(list_tasksのlists[].id)のリストをdisplaynameに改名。削除はdelete_task_listを使う。",
+                        inputSchema: z.object({
+                                action: z.enum(["create", "rename"]).describe("'create' または 'rename'"),
+                                displayname: z.string().describe("リストの表示名 (例: 買い物, 仕事)。renameでは変更後の名前"),
+                                id: z.string().optional().describe("renameの対象リストのid"),
+                        }),
+                },
+                async ({ action, displayname, id }) => {
+                        try {
+                                if (action === "create") {
+                                        const newId = crypto.randomUUID();
+                                        // Cloudflare Workersのfetch()はMKCALENDARメソッドを受け付けないため、
+                                        // RFC5689 (Extended MKCOL) に従い、標準のMKCOLメソッド+ボディでresourcetypeに
+                                        // calendarを含めることでカレンダーコレクションを作成する(SabreDAV/Nextcloudが対応)。
+                                        const body = `<?xml version="1.0" encoding="utf-8"?>
+<d:mkcol xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:set>
+    <d:prop>
+      <d:resourcetype>
+        <d:collection/>
+        <c:calendar/>
+      </d:resourcetype>
+      <d:displayname>${escapeXml(displayname)}</d:displayname>
+      <c:supported-calendar-component-set>
+        <c:comp name="VTODO"/>
+      </c:supported-calendar-component-set>
+    </d:prop>
+  </d:set>
+</d:mkcol>`;
+                                        const res = await fetch(`${calendarsBaseUrl(env)}${newId}/`, {
+                                                method: "MKCOL",
+                                                headers: {
+                                                        Authorization: authHeader(env),
+                                                        "Content-Type": "application/xml; charset=utf-8",
+                                                },
+                                                body,
+                                        });
+                                        if (!res.ok) throw new Error(`作成に失敗: ${res.status} ${await res.text()}`);
+                                        return {
+                                                content: [{ type: "text", text: `タスクリスト「${displayname}」を作成した。id: ${newId}` }],
+                                        };
+                                }
+
+                                if (!id) throw new Error("renameにはidが必要。");
+                                const body = `<?xml version="1.0" encoding="utf-8"?>
+<d:propertyupdate xmlns:d="DAV:">
+  <d:set>
+    <d:prop>
+      <d:displayname>${escapeXml(displayname)}</d:displayname>
+    </d:prop>
+  </d:set>
+</d:propertyupdate>`;
+                                const res = await fetch(`${calendarsBaseUrl(env)}${id}/`, {
+                                        method: "PROPPATCH",
+                                        headers: {
+                                                Authorization: authHeader(env),
+                                                "Content-Type": "application/xml; charset=utf-8",
+                                        },
+                                        body,
+                                });
+                                if (!res.ok) throw new Error(`改名に失敗: ${res.status} ${await res.text()}`);
+                                return { content: [{ type: "text", text: `表示名を「${displayname}」に変更した。` }] };
+                        } catch (err) {
+                                return {
+                                        content: [
+                                                { type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` },
+                                        ],
+                                        isError: true,
+                                };
+                        }
+                },
+        );
+
+        server.registerTool(
+                "delete_task_list",
+                {
+                        description:
+                                "タスクリストを削除する。中のタスクも全て消える破壊的操作なので、実行前に必ずユーザーに確認すること。",
+                        inputSchema: z.object({
+                                id: z.string().describe("削除対象リストのid (list_tasksのlists[].id)"),
+                        }),
+                },
+                async ({ id }) => {
+                        try {
+                                const res = await fetch(`${calendarsBaseUrl(env)}${id}/`, {
+                                        method: "DELETE",
+                                        headers: { Authorization: authHeader(env) },
+                                });
+                                if (!res.ok && res.status !== 404) {
+                                        throw new Error(`削除に失敗: ${res.status} ${await res.text()}`);
+                                }
+                                return {
+                                        content: [{ type: "text", text: `タスクリストを削除した。id: ${id}` }],
+                                };
+                        } catch (err) {
+                                return {
+                                        content: [
+                                                { type: "text", text: `エラー: ${err instanceof Error ? err.message : String(err)}` },
+                                        ],
+                                        isError: true,
+                                };
+                        }
+                },
+        );
+
+        //task list management tools end
 
         return server;
 }
